@@ -14,6 +14,7 @@ use base64::{engine::general_purpose, Engine as _};
 use dotenv::dotenv;
 use log::info;
 use rocket::data::ToByteUnit;
+use rocket::form::Form;
 use rocket::http::{ContentType, Header, Status};
 use rocket::response::{Redirect, status::Custom};
 use rocket::serde::{json::Json, Deserialize, Serialize};
@@ -34,6 +35,13 @@ lazy_static! {
 struct ApiUploadRequest {
     base64: Option<String>,
     url: Option<String>,
+}
+
+// Struct to handle application/x-www-form-urlencoded data
+#[derive(FromForm)]
+struct UrlEncodedUpload<'r> {
+    #[field(name = "image")]
+    base64: &'r str,
 }
 
 #[derive(Serialize)]
@@ -102,11 +110,16 @@ fn mime_to_extension(mime_type: &str) -> &str {
     mime_type.split('/').last().unwrap_or("jpg")
 }
 
+// This is the core logic, now fully reusable by all upload endpoints.
 async fn process_and_respond(
     image_bytes: Vec<u8>,
     content_type_string: &str,
     images_collection: &mongodb::Collection<mongodb::bson::Document>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
+    if image_bytes.is_empty() {
+        return Err(create_error(Status::BadRequest, "Image data cannot be empty."));
+    }
+
     let mut reader = image::io::Reader::new(Cursor::new(&image_bytes));
     reader.set_format(util::mimetype_to_format(content_type_string));
     let decoded_image = reader.decode().map_err(|e| create_error(Status::BadRequest, &format!("Failed to decode image: {}", e)))?;
@@ -137,8 +150,6 @@ async fn process_and_respond(
     let creation_time = inserted_doc.get_datetime("date").unwrap().timestamp_millis() / 1000;
     let image_ext = mime_to_extension(&encoded_image.content_type);
     let thumb_ext = mime_to_extension(&encoded_thumbnail.content_type);
-
-    // UPDATED: Changed the URL structure to /i/<id> to prevent route collisions
     let image_url = format!("{}/i/{}", base_url, id_str);
     let thumb_url = format!("{}/i/{}/thumb", base_url, id_str);
 
@@ -154,7 +165,7 @@ async fn process_and_respond(
             size: encoded_image.data.len().to_string(),
             time: creation_time.to_string(),
             expiration: "0".to_string(),
-            delete_url: format!("{}/delete/placeholder", image_url), // Placeholder delete URL
+            delete_url: format!("{}/delete/placeholder", image_url),
             image: ApiImageVariant { filename: format!("{}.{}", id_str, image_ext), name: id_str.clone(), mime: encoded_image.content_type.clone(), extension: image_ext.to_string(), url: image_url.clone() },
             medium: ApiImageVariant { filename: format!("{}.{}", id_str, image_ext), name: id_str.clone(), mime: encoded_image.content_type.clone(), extension: image_ext.to_string(), url: image_url.clone() },
             thumb: ApiImageVariant { filename: format!("{}.{}", id_str, thumb_ext), name: id_str.clone(), mime: encoded_thumbnail.content_type.clone(), extension: thumb_ext.to_string(), url: thumb_url },
@@ -190,58 +201,80 @@ async fn upload_from_web_route(
         let content_type = file.content_type.as_ref().ok_or_else(|| create_error(Status::BadRequest, "MIME type is required"))?.to_string();
         
         let response = process_and_respond(image_bytes, &content_type, &collections.images).await?;
-        // UPDATED: The uri! macro correctly builds the new path for the named function
         Ok(Redirect::to(uri!(view_image_route(response.data.id.clone()))))
     } else {
         Err(create_error(Status::BadRequest, "No image file found in form."))
     }
 }
 
-#[post("/api/upload", data = "<data>")]
-async fn api_upload_route(
+// --- UPDATED API ROUTES ---
+
+// Route 1: Handles application/json
+#[post("/api/upload", rank = 1, format = "json", data = "<payload>")]
+async fn api_upload_json(
+    payload: Json<ApiUploadRequest>,
+    collections: &State<db::Collections>,
+) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
+    match (&payload.base64, &payload.url) {
+        (Some(ref b64), None) => {
+            let image_bytes = general_purpose::STANDARD.decode(b64).map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string"))?;
+            let kind = infer::get(&image_bytes).ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type from Base64 data."))?;
+            process_and_respond(image_bytes, kind.mime_type(), &collections.images).await
+        },
+        (None, Some(ref url)) => {
+            let (image_bytes, ct) = download_image_from_url(url).await.map_err(|e| create_error(Status::BadRequest, &e))?;
+            process_and_respond(image_bytes, &ct, &collections.images).await
+        },
+        _ => Err(create_error(Status::BadRequest, "Please provide 'base64' or 'url' in the JSON payload, but not both.")),
+    }
+}
+
+// Route 2: Handles application/x-www-form-urlencoded
+#[post("/api/upload", rank = 2, format = "form", data = "<form>")]
+async fn api_upload_form(
+    form: Form<UrlEncodedUpload<'_>>,
+    collections: &State<db::Collections>,
+) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
+    let image_bytes = general_purpose::STANDARD.decode(form.base64).map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string in 'image' field"))?;
+    let kind = infer::get(&image_bytes).ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type from Base64 data."))?;
+    process_and_respond(image_bytes, kind.mime_type(), &collections.images).await
+}
+
+// Route 3: Handles multipart/form-data as a fallback
+#[post("/api/upload", rank = 3, data = "<data>")]
+async fn api_upload_multipart(
     content_type: &ContentType,
     data: Data<'_>,
     collections: &State<db::Collections>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
-    if content_type.is_form_data() {
-        let options = MultipartFormDataOptions::with_multipart_form_data_fields(vec![
-            MultipartFormDataField::file("image").content_type_by_string(Some(mime::IMAGE_STAR)).unwrap(),
-        ]);
-        let form_data = MultipartFormData::parse(content_type, data, options).await.unwrap();
-        if let Some(file_fields) = form_data.files.get("image") {
-            let file = &file_fields[0];
-            let image_bytes = tokio::fs::read(&file.path).await.map_err(|_| create_error(Status::InternalServerError, "Could not read temp file"))?;
-            let ct = file.content_type.as_ref().ok_or_else(|| create_error(Status::BadRequest, "MIME type is required"))?.to_string();
-            process_and_respond(image_bytes, &ct, &collections.images).await
-        } else {
-            Err(create_error(Status::BadRequest, "Form field 'image' is missing."))
-        }
-    } else if content_type.is_json() {
-        let bytes = data.open(10.megabytes()).into_bytes().await.map_err(|e| create_error(Status::BadRequest, &format!("Failed to read payload: {}", e)))?;
-        let payload: ApiUploadRequest = rocket::serde::json::from_slice(&bytes).map_err(|e| create_error(Status::BadRequest, &format!("Invalid JSON: {}", e)))?;
+    if !content_type.is_form_data() {
+        return Err(create_error(Status::UnsupportedMediaType, "Content-Type must be 'multipart/form-data', 'application/json', or 'application/x-www-form-urlencoded'."));
+    }
 
-        match (&payload.base64, &payload.url) {
-            (Some(ref b64), None) => {
-                let image_bytes = general_purpose::STANDARD.decode(b64).map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string"))?;
-                let kind = infer::get(&image_bytes).ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type from Base64 data."))?;
-                process_and_respond(image_bytes, kind.mime_type(), &collections.images).await
-            },
-            (None, Some(ref url)) => {
-                let (image_bytes, ct) = download_image_from_url(url).await.map_err(|e| create_error(Status::BadRequest, &e))?;
+    let options = MultipartFormDataOptions::with_multipart_form_data_fields(vec![
+        MultipartFormDataField::file("image").content_type_by_string(Some(mime::IMAGE_STAR)).unwrap(),
+    ]);
+
+    match MultipartFormData::parse(content_type, data, options).await {
+        Ok(form_data) => {
+            if let Some(file_fields) = form_data.files.get("image") {
+                let file = &file_fields[0];
+                let image_bytes = tokio::fs::read(&file.path).await.map_err(|_| create_error(Status::InternalServerError, "Could not read temp file"))?;
+                let ct = file.content_type.as_ref().ok_or_else(|| create_error(Status::BadRequest, "MIME type is required"))?.to_string();
                 process_and_respond(image_bytes, &ct, &collections.images).await
-            },
-            _ => Err(create_error(Status::BadRequest, "Please provide 'base64' or 'url' in the JSON payload, but not both.")),
+            } else {
+                Err(create_error(Status::BadRequest, "Form field 'image' is missing."))
+            }
         }
-    } else {
-        Err(create_error(Status::UnsupportedMediaType, "Content-Type must be 'multipart/form-data' or 'application/json'."))
+        Err(e) => Err(create_error(Status::BadRequest, &format!("Failed to parse multipart form: {}", e))),
     }
 }
+
 
 #[derive(Responder)]
 #[response(status = 200)]
 struct ImageResponder(Vec<u8>, Header<'static>);
 
-// UPDATED: Route changed from /<id> to /i/<id> to resolve collision
 #[get("/i/<id>")]
 async fn view_image_route(id: String, collections: &State<db::Collections>) -> Option<ImageResponder> {
     let doc = db::get_image(&collections.images, &id).await.ok()??;
@@ -256,7 +289,6 @@ async fn view_image_route(id: String, collections: &State<db::Collections>) -> O
     Some(ImageResponder(data, Header::new("Content-Type", ct)))
 }
 
-// UPDATED: Route changed from /<id>/thumb to /i/<id>/thumb to resolve collision
 #[get("/i/<id>/thumb")]
 async fn view_thumbnail_route(id: String, collections: &State<db::Collections>) -> Option<ImageResponder> {
     let doc = db::get_image(&collections.images, &id).await.ok()??;
@@ -265,10 +297,8 @@ async fn view_thumbnail_route(id: String, collections: &State<db::Collections>) 
     Some(ImageResponder(data, Header::new("Content-Type", ct)))
 }
 
-// This route now correctly redirects to the non-colliding /i/<id> route
 #[get("/image/<id>")]
 fn redirect_image_route(id: String) -> Redirect {
-    // UPDATED: The uri! macro correctly builds the new path for the named function
     Redirect::to(uri!(view_image_route(id)))
 }
 
@@ -288,7 +318,10 @@ async fn rocket() -> _ {
         .mount("/", routes![
             index,
             upload_from_web_route,
-            api_upload_route,
+            // UPDATED: Mount the three new, specific API routes
+            api_upload_json,
+            api_upload_form,
+            api_upload_multipart,
             view_image_route,
             redirect_image_route,
             view_thumbnail_route
