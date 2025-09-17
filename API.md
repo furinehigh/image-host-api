@@ -17,14 +17,14 @@ Complete API reference for the Rust Image Hosting Server.
 The API supports two authentication methods:
 
 ### 1. JWT Bearer Tokens
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
-\`\`\`
+```
 
 ### 2. API Keys
-\`\`\`http
+```http
 Authorization: ApiKey <api_key>
-\`\`\`
+```
 
 ---
 
@@ -36,16 +36,16 @@ Create a new user account.
 **Endpoint:** `POST /api/v1/auth/register`
 
 **Request Body:**
-\`\`\`json
+```json
 {
   "username": "john_doe",
   "email": "john@example.com",
   "password": "secure_password123"
 }
-\`\`\`
+```
 
 **Response:** `201 Created`
-\`\`\`json
+```json
 {
   "id": "uuid-here",
   "username": "john_doe",
@@ -54,7 +54,7 @@ Create a new user account.
   "quota_limit": 1073741824,
   "created_at": "2024-01-15T10:30:00Z"
 }
-\`\`\`
+```
 
 **Error Responses:**
 - `400 Bad Request` - Invalid input data
@@ -68,15 +68,15 @@ Authenticate and receive JWT token.
 **Endpoint:** `POST /api/v1/auth/login`
 
 **Request Body:**
-\`\`\`json
+```json
 {
   "email": "john@example.com",
   "password": "secure_password123"
 }
-\`\`\`
+```
 
 **Response:** `200 OK`
-\`\`\`json
+```json
 {
   "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "token_type": "Bearer",
@@ -87,7 +87,7 @@ Authenticate and receive JWT token.
     "email": "john@example.com"
   }
 }
-\`\`\`
+```
 
 **Error Responses:**
 - `401 Unauthorized` - Invalid credentials
@@ -101,18 +101,18 @@ Refresh an expired JWT token.
 **Endpoint:** `POST /api/v1/auth/refresh`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <expired_token>
-\`\`\`
+```
 
 **Response:** `200 OK`
-\`\`\`json
+```json
 {
   "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "token_type": "Bearer",
   "expires_in": 3600
 }
-\`\`\`
+```
 
 ---
 
@@ -122,20 +122,20 @@ Generate a new API key for programmatic access.
 **Endpoint:** `POST /api/v1/auth/api-keys`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
-\`\`\`
+```
 
 **Request Body:**
-\`\`\`json
+```json
 {
   "name": "My App Integration",
   "permissions": ["upload", "read", "delete"]
 }
-\`\`\`
+```
 
 **Response:** `201 Created`
-\`\`\`json
+```json
 {
   "id": "uuid-here",
   "name": "My App Integration",
@@ -144,7 +144,7 @@ Authorization: Bearer <jwt_token>
   "created_at": "2024-01-15T10:30:00Z",
   "last_used": null
 }
-\`\`\`
+```
 
 ---
 
@@ -154,12 +154,12 @@ Get all API keys for the authenticated user.
 **Endpoint:** `GET /api/v1/auth/api-keys`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
-\`\`\`
+```
 
 **Response:** `200 OK`
-\`\`\`json
+```json
 {
   "api_keys": [
     {
@@ -171,7 +171,7 @@ Authorization: Bearer <jwt_token>
     }
   ]
 }
-\`\`\`
+```
 
 ---
 
@@ -181,9 +181,9 @@ Delete an API key.
 **Endpoint:** `DELETE /api/v1/auth/api-keys/{key_id}`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
-\`\`\`
+```
 
 **Response:** `204 No Content`
 
@@ -197,21 +197,21 @@ Upload a new image file.
 **Endpoint:** `POST /api/v1/upload`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
 Content-Type: multipart/form-data
-\`\`\`
+```
 
 **Request Body:**
-\`\`\`
+```
 Form data:
 - file: <image_file>
 - alt_text: "Optional description" (optional)
 - tags: "tag1,tag2,tag3" (optional)
-\`\`\`
+```
 
 **Response:** `201 Created`
-\`\`\`json
+```json
 {
   "id": "uuid-here",
   "filename": "image.jpg",
@@ -227,7 +227,7 @@ Form data:
   "thumbnail_url": "/api/v1/images/uuid-here/transform?width=200&height=200",
   "created_at": "2024-01-15T10:30:00Z"
 }
-\`\`\`
+```
 
 **Error Responses:**
 - `400 Bad Request` - Invalid file format or size
@@ -254,9 +254,9 @@ Get paginated list of user's images.
 **Endpoint:** `GET /api/v1/images`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
-\`\`\`
+```
 
 **Query Parameters:**
 - `page` (integer, default: 1) - Page number
@@ -267,12 +267,12 @@ Authorization: Bearer <jwt_token>
 - `search` (string) - Search in filename and alt_text
 
 **Example:**
-\`\`\`http
+```http
 GET /api/v1/images?page=1&limit=10&tags=nature,landscape&sort=created_at&order=desc
-\`\`\`
+```
 
 **Response:** `200 OK`
-\`\`\`json
+```json
 {
   "images": [
     {
@@ -299,7 +299,7 @@ GET /api/v1/images?page=1&limit=10&tags=nature,landscape&sort=created_at&order=d
     "has_prev": false
   }
 }
-\`\`\`
+```
 
 ---
 
@@ -309,9 +309,9 @@ Retrieve original image file.
 **Endpoint:** `GET /api/v1/images/{image_id}`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token> (optional for public images)
-\`\`\`
+```
 
 **Response:** `200 OK`
 - Content-Type: Original image MIME type
@@ -347,7 +347,7 @@ Get transformed/resized version of image.
 - `crop` - Resize and crop to exact dimensions
 
 **Examples:**
-\`\`\`http
+```http
 # Resize to 800x600, maintain aspect ratio
 GET /api/v1/images/uuid/transform?width=800&height=600&crop=fit
 
@@ -359,7 +359,7 @@ GET /api/v1/images/uuid/transform?width=200&height=200&crop=fill&blur=1.0
 
 # Rotate and convert to grayscale
 GET /api/v1/images/uuid/transform?rotate=90&grayscale=true
-\`\`\`
+```
 
 **Response:** `200 OK`
 - Transformed image data
@@ -378,12 +378,12 @@ Retrieve image information without downloading the file.
 **Endpoint:** `GET /api/v1/images/{image_id}/info`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
-\`\`\`
+```
 
 **Response:** `200 OK`
-\`\`\`json
+```json
 {
   "id": "uuid-here",
   "filename": "image.jpg",
@@ -407,7 +407,7 @@ Authorization: Bearer <jwt_token>
   "created_at": "2024-01-15T10:30:00Z",
   "updated_at": "2024-01-15T10:30:00Z"
 }
-\`\`\`
+```
 
 ---
 
@@ -417,28 +417,28 @@ Update image metadata.
 **Endpoint:** `PATCH /api/v1/images/{image_id}`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
 Content-Type: application/json
-\`\`\`
+```
 
 **Request Body:**
-\`\`\`json
+```json
 {
   "alt_text": "Updated description",
   "tags": ["new-tag", "updated"]
 }
-\`\`\`
+```
 
 **Response:** `200 OK`
-\`\`\`json
+```json
 {
   "id": "uuid-here",
   "alt_text": "Updated description",
   "tags": ["new-tag", "updated"],
   "updated_at": "2024-01-15T11:00:00Z"
 }
-\`\`\`
+```
 
 ---
 
@@ -448,9 +448,9 @@ Permanently delete an image.
 **Endpoint:** `DELETE /api/v1/images/{image_id}`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
-\`\`\`
+```
 
 **Response:** `204 No Content`
 
@@ -468,12 +468,12 @@ Check current storage usage and limits.
 **Endpoint:** `GET /api/v1/user/quota`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
-\`\`\`
+```
 
 **Response:** `200 OK`
-\`\`\`json
+```json
 {
   "used": 524288000,
   "limit": 1073741824,
@@ -485,7 +485,7 @@ Authorization: Bearer <jwt_token>
     "thumbnails": 4288000
   }
 }
-\`\`\`
+```
 
 ---
 
@@ -495,12 +495,12 @@ Retrieve user account information.
 **Endpoint:** `GET /api/v1/user/profile`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
-\`\`\`
+```
 
 **Response:** `200 OK`
-\`\`\`json
+```json
 {
   "id": "uuid-here",
   "username": "john_doe",
@@ -512,7 +512,7 @@ Authorization: Bearer <jwt_token>
   "created_at": "2024-01-01T00:00:00Z",
   "last_login": "2024-01-15T10:30:00Z"
 }
-\`\`\`
+```
 
 ---
 
@@ -522,28 +522,28 @@ Update user account information.
 **Endpoint:** `PATCH /api/v1/user/profile`
 
 **Headers:**
-\`\`\`http
+```http
 Authorization: Bearer <jwt_token>
 Content-Type: application/json
-\`\`\`
+```
 
 **Request Body:**
-\`\`\`json
+```json
 {
   "username": "new_username",
   "email": "new@example.com"
 }
-\`\`\`
+```
 
 **Response:** `200 OK`
-\`\`\`json
+```json
 {
   "id": "uuid-here",
   "username": "new_username",
   "email": "new@example.com",
   "updated_at": "2024-01-15T11:00:00Z"
 }
-\`\`\`
+```
 
 ---
 
@@ -555,7 +555,7 @@ Check service health and dependencies.
 **Endpoint:** `GET /health`
 
 **Response:** `200 OK`
-\`\`\`json
+```json
 {
   "status": "healthy",
   "timestamp": "2024-01-15T10:30:00Z",
@@ -586,7 +586,7 @@ Check service health and dependencies.
     }
   }
 }
-\`\`\`
+```
 
 **Unhealthy Response:** `503 Service Unavailable`
 
@@ -598,7 +598,7 @@ Prometheus metrics endpoint.
 **Endpoint:** `GET /metrics`
 
 **Response:** `200 OK` (Prometheus format)
-\`\`\`
+```
 # HELP http_requests_total Total number of HTTP requests
 # TYPE http_requests_total counter
 http_requests_total{method="GET",status="200"} 1234
@@ -608,7 +608,7 @@ http_requests_total{method="GET",status="200"} 1234
 image_processing_duration_seconds_bucket{le="0.1"} 100
 image_processing_duration_seconds_bucket{le="0.5"} 450
 image_processing_duration_seconds_bucket{le="1.0"} 800
-\`\`\`
+```
 
 ---
 
@@ -626,7 +626,7 @@ Interactive API documentation (Swagger UI).
 ### Error Response Format
 All errors follow a consistent JSON format:
 
-\`\`\`json
+```json
 {
   "error": {
     "code": "VALIDATION_ERROR",
@@ -639,7 +639,7 @@ All errors follow a consistent JSON format:
     "request_id": "req_123456789"
   }
 }
-\`\`\`
+```
 
 ### Common Error Codes
 
@@ -669,15 +669,15 @@ All errors follow a consistent JSON format:
 ### Rate Limit Headers
 All responses include rate limit information:
 
-\`\`\`http
+```http
 X-RateLimit-Limit: 100
 X-RateLimit-Remaining: 95
 X-RateLimit-Reset: 1642248600
 X-RateLimit-Window: 60
-\`\`\`
+```
 
 ### Rate Limit Exceeded Response
-\`\`\`json
+```json
 {
   "error": {
     "code": "RATE_LIMIT_EXCEEDED",
@@ -689,7 +689,7 @@ X-RateLimit-Window: 60
     }
   }
 }
-\`\`\`
+```
 
 ---
 
@@ -697,10 +697,10 @@ X-RateLimit-Window: 60
 
 ### Complete Upload Workflow
 
-\`\`\`bash
+```bash
 # 1. Register user
-curl -X POST http://localhost:3000/api/v1/auth/register \
-  -H "Content-Type: application/json" \
+curl -X POST http://localhost:3000/api/v1/auth/register 
+  -H "Content-Type: application/json" 
   -d '{
     "username": "photographer",
     "email": "photo@example.com",
@@ -708,33 +708,33 @@ curl -X POST http://localhost:3000/api/v1/auth/register \
   }'
 
 # 2. Login and get token
-TOKEN=$(curl -X POST http://localhost:3000/api/v1/auth/login \
-  -H "Content-Type: application/json" \
+TOKEN=$(curl -X POST http://localhost:3000/api/v1/auth/login 
+  -H "Content-Type: application/json" 
   -d '{
     "email": "photo@example.com",
     "password": "secure123"
   }' | jq -r '.access_token')
 
 # 3. Upload image
-IMAGE_ID=$(curl -X POST http://localhost:3000/api/v1/upload \
-  -H "Authorization: Bearer $TOKEN" \
-  -F "file=@photo.jpg" \
-  -F "alt_text=Beautiful landscape" \
+IMAGE_ID=$(curl -X POST http://localhost:3000/api/v1/upload 
+  -H "Authorization: Bearer $TOKEN" 
+  -F "file=@photo.jpg" 
+  -F "alt_text=Beautiful landscape" 
   -F "tags=nature,landscape,sunset" | jq -r '.id')
 
 # 4. Get thumbnail
-curl "http://localhost:3000/api/v1/images/$IMAGE_ID/transform?width=300&height=200&crop=fill" \
-  -H "Authorization: Bearer $TOKEN" \
+curl "http://localhost:3000/api/v1/images/$IMAGE_ID/transform?width=300&height=200&crop=fill" 
+  -H "Authorization: Bearer $TOKEN" 
   -o thumbnail.jpg
 
 # 5. List all images
-curl "http://localhost:3000/api/v1/images?tags=nature&limit=10" \
+curl "http://localhost:3000/api/v1/images?tags=nature&limit=10" 
   -H "Authorization: Bearer $TOKEN"
-\`\`\`
+```
 
 ### JavaScript/Node.js Example
 
-\`\`\`javascript
+```javascript
 const API_BASE = 'http://localhost:3000/api/v1';
 
 class ImageHostingClient {
@@ -794,11 +794,11 @@ const thumbnailUrl = client.getImageUrl(result.id, {
   crop: 'fill',
   format: 'webp'
 });
-\`\`\`
+```
 
 ### Python Example
 
-\`\`\`python
+```python
 import requests
 import json
 
@@ -857,7 +857,7 @@ webp_url = client.get_image_url(
     format='webp',
     quality=85
 )
-\`\`\`
+```
 
 ---
 
