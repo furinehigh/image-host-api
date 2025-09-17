@@ -17,21 +17,17 @@ RUN apt-get update && \
 # Create app directory
 WORKDIR /app
 
-# Copy workspace files
+# Copy manifests first
 COPY Cargo.toml Cargo.lock ./
 
-# Copy the actual crate
-COPY image-host-api ./image-host-api
+# Copy source so Cargo sees main.rs
+COPY src ./src
+COPY Rocket.toml .   # include if your app uses it
 
-WORKDIR /app/image-host-api
-
+# Fetch dependencies (this caches deps properly)
 RUN cargo fetch
-RUN cargo build --release --bin image-host-api
 
-# Copy source
-COPY . .
-
-# Build final binary
+# Build release binary
 RUN cargo build --release --bin image-host-api
 
 ########################################
@@ -53,6 +49,9 @@ WORKDIR /app
 
 # Copy binary
 COPY --from=builder /app/target/release/image-host-api /usr/local/bin/image-host-api
+
+# Copy config files if needed
+COPY Rocket.toml .
 
 # Permissions
 RUN chown appuser:appuser /usr/local/bin/image-host-api
