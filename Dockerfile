@@ -17,11 +17,14 @@ RUN apt-get update && \
 # Create app directory
 WORKDIR /app
 
-# Copy dependency files first for caching
+# Copy workspace files
 COPY Cargo.toml Cargo.lock ./
-# If you have a workspace, copy the necessary workspace manifests
 
-# Build dependencies only (to cache)
+# Copy the actual crate
+COPY rust-image-host ./rust-image-host
+
+WORKDIR /app/rust-image-host
+
 RUN cargo fetch
 RUN cargo build --release --bin rust-image-host
 
