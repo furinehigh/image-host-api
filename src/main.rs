@@ -217,25 +217,6 @@ async fn api_upload_route(
         } else {
             Err(create_error(Status::BadRequest, "Form field 'image' is missing."))
         }
-    } else if content_type.is_json() {
-        let bytes = data.open(10.megabytes()).into_bytes().await.map_err(|e| create_error(Status::BadRequest, &format!("Failed to read payload: {}", e)))?;
-        
-        // FIX #1: Use the full path to `from_slice`
-        let payload: ApiUploadRequest = rocket::serde::json::from_slice(&bytes).map_err(|e| create_error(Status::BadRequest, &format!("Invalid JSON: {}", e)))?;
-
-        // FIX #2: Use `ref` in the match pattern to borrow instead of move
-        match (&payload.base64, &payload.url) {
-            (Some(ref b64), None) => {
-                let image_bytes = general_purpose::STANDARD.decode(b64).map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string"))?;
-                let kind = infer::get(&image_bytes).ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type from Base64 data."))?;
-                process_and_respond(image_bytes, kind.mime_type(), &collections.images).await
-            },
-            (None, Some(ref url)) => {
-                let (image_bytes, ct) = download_image_from_url(url).await.map_err(|e| create_error(Status::BadRequest, &e))?;
-                process_and_respond(image_bytes, &ct, &collections.images).await
-            },
-            _ => Err(create_error(Status::BadRequest, "Please provide 'base64' or 'url' in the JSON payload, but not both.")),
-        }
     } else {
         Err(create_error(Status::UnsupportedMediaType, "Content-Type must be 'multipart/form-data' or 'application/json'."))
     }
