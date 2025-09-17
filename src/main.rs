@@ -137,8 +137,10 @@ async fn process_and_respond(
     let creation_time = inserted_doc.get_datetime("date").unwrap().timestamp_millis() / 1000;
     let image_ext = mime_to_extension(&encoded_image.content_type);
     let thumb_ext = mime_to_extension(&encoded_thumbnail.content_type);
-    let image_url = format!("{}/{}", base_url, id_str);
-    let thumb_url = format!("{}/{}/thumb", base_url, id_str);
+
+    // UPDATED: Changed the URL structure to /i/<id> to prevent route collisions
+    let image_url = format!("{}/i/{}", base_url, id_str);
+    let thumb_url = format!("{}/i/{}/thumb", base_url, id_str);
 
     Ok(Json(ApiResponse {
         data: ApiImageData {
@@ -152,7 +154,7 @@ async fn process_and_respond(
             size: encoded_image.data.len().to_string(),
             time: creation_time.to_string(),
             expiration: "0".to_string(),
-            delete_url: format!("{}/{}/delete/placeholder", base_url, id_str),
+            delete_url: format!("{}/delete/placeholder", image_url), // Placeholder delete URL
             image: ApiImageVariant { filename: format!("{}.{}", id_str, image_ext), name: id_str.clone(), mime: encoded_image.content_type.clone(), extension: image_ext.to_string(), url: image_url.clone() },
             medium: ApiImageVariant { filename: format!("{}.{}", id_str, image_ext), name: id_str.clone(), mime: encoded_image.content_type.clone(), extension: image_ext.to_string(), url: image_url.clone() },
             thumb: ApiImageVariant { filename: format!("{}.{}", id_str, thumb_ext), name: id_str.clone(), mime: encoded_thumbnail.content_type.clone(), extension: thumb_ext.to_string(), url: thumb_url },
@@ -188,6 +190,7 @@ async fn upload_from_web_route(
         let content_type = file.content_type.as_ref().ok_or_else(|| create_error(Status::BadRequest, "MIME type is required"))?.to_string();
         
         let response = process_and_respond(image_bytes, &content_type, &collections.images).await?;
+        // UPDATED: The uri! macro correctly builds the new path for the named function
         Ok(Redirect::to(uri!(view_image_route(response.data.id.clone()))))
     } else {
         Err(create_error(Status::BadRequest, "No image file found in form."))
@@ -238,7 +241,8 @@ async fn api_upload_route(
 #[response(status = 200)]
 struct ImageResponder(Vec<u8>, Header<'static>);
 
-#[get("/<id>")]
+// UPDATED: Route changed from /<id> to /i/<id> to resolve collision
+#[get("/i/<id>")]
 async fn view_image_route(id: String, collections: &State<db::Collections>) -> Option<ImageResponder> {
     let doc = db::get_image(&collections.images, &id).await.ok()??;
     let data = doc.get_binary_generic("data").unwrap().clone();
@@ -252,7 +256,8 @@ async fn view_image_route(id: String, collections: &State<db::Collections>) -> O
     Some(ImageResponder(data, Header::new("Content-Type", ct)))
 }
 
-#[get("/<id>/thumb")]
+// UPDATED: Route changed from /<id>/thumb to /i/<id>/thumb to resolve collision
+#[get("/i/<id>/thumb")]
 async fn view_thumbnail_route(id: String, collections: &State<db::Collections>) -> Option<ImageResponder> {
     let doc = db::get_image(&collections.images, &id).await.ok()??;
     let data = doc.get_binary_generic("thumbnail_data").unwrap().clone();
@@ -260,8 +265,10 @@ async fn view_thumbnail_route(id: String, collections: &State<db::Collections>) 
     Some(ImageResponder(data, Header::new("Content-Type", ct)))
 }
 
+// This route now correctly redirects to the non-colliding /i/<id> route
 #[get("/image/<id>")]
 fn redirect_image_route(id: String) -> Redirect {
+    // UPDATED: The uri! macro correctly builds the new path for the named function
     Redirect::to(uri!(view_image_route(id)))
 }
 
