@@ -9,7 +9,7 @@ services:
     environment:
       - MONGODB_URI=mongodb://mongo:27017
       - MONGODB_DB_NAME=image_host
-      - HOST=localhost:8000
+      - HOST=i.dishis.tech
       - ROCKET_ADDRESS=0.0.0.0
       - ROCKET_PORT=8080
     depends_on:
