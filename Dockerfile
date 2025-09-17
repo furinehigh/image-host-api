@@ -1,5 +1,5 @@
 # Multi-stage build for Rust application
-FROM rust:1.75-slim as builder
+FROM rust:latest as builder
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
