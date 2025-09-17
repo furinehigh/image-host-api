@@ -3,8 +3,7 @@
 ########################################
 # Builder stage
 ########################################
-FROM rust:latest as builder
-
+FROM rust:1.71 as builder
 
 # Install system dependencies that might be needed (libvips, etc.)
 RUN apt-get update && \

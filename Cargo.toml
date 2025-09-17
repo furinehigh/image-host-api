@@ -1,5 +1,5 @@
 [package]
-edition = "2025"
+edition = "2021"
 name = "image-host"
 version = "0.0.1"
 
