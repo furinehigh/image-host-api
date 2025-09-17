@@ -289,7 +289,7 @@ async fn rocket() -> _ {
         .mount("/", routes![
             index,
             upload_from_web_route,
-            api_upload_route,
+            api_upload_route, // This should be the ONLY route for POST /api/upload
             view_image_route,
             redirect_image_route,
             view_thumbnail_route
