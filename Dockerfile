@@ -18,6 +18,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 
+ENV DATABASE_URL="postgresql://postgres:postgres@localhost:5432/image_hosting"
+
+
 # Build the application
 RUN cargo build --release
 
