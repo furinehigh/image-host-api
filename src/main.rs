@@ -1,6 +1,6 @@
 #[macro_use]
 extern crate rocket;
-
+use serde_json;
 #[macro_use]
 extern crate lazy_static;
 
