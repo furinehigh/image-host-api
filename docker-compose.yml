@@ -1,64 +1,32 @@
+# docker-compose.yml
 version: "3.8"
 
 services:
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: . # Build the Dockerfile in the current directory
+    container_name: image-host-api-app-1
+    ports:
+      - "8000:8080" # Map host port 8000 to the container's port 8080
+    environment:
+      # These are the variables your Rust code is looking for
+      - MONGODB_URI=mongodb://mongo:27017
+      - MONGODB_DB_NAME=image_host
+      # This variable is used by your code to generate full URLs
+      - HOST=localhost:8000
+      # These are for Rocket, telling it to listen on all interfaces inside the container
+      - ROCKET_ADDRESS=0.0.0.0
+      - ROCKET_PORT=8080
     depends_on:
-      - postgres
-      - redis
-      - minio
-    environment:
-      # DB
-      DATABASE_URL: "postgres://user:password@postgres:5432/dbname"
-      # Redis
-      REDIS_URL: "redis://redis:6379"
-      # Storage path (for local block storage mount or container volume)
-      STORAGE_PATH: "/storage/images"
-      # If using S3 or MinIO
-      S3_ENDPOINT: "http://minio:9000"
-      S3_ACCESS_KEY: "minioadmin"
-      S3_SECRET_KEY: "minioadmin"
-      S3_BUCKET: "images"
-      # App config
-      JWT_SECRET: "some-secret-key"  # change this
-      MAX_UPLOAD_SIZE: "20971520"     # e.g. 20 MB
-      LOG_LEVEL: "info"
-      APP_ADDR: "0.0.0.0:8080"
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./storage/images:/storage/images
-    # optionally mount config, logs, etc.
+      - mongo # Ensures the database starts before the app
 
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_DB: dbname
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-    ports:
-      - "5432:5432"
+  mongo:
+    image: mongo:latest
+    container_name: image-host-api-mongo-1
+    restart: always
     volumes:
-      - pgdata:/var/lib/postgresql/data
-
-  redis:
-    image: redis:7-alpine
+      - mongodb_data:/data/db # Persist database data
     ports:
-      - "6379"
-
-  minio:
-    image: minio/minio:latest
-    command: server /data
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"
-    volumes:
-      - minio_data:/data
+      - "27017:27017" # Optional: allows you to connect to the DB from your host machine
 
 volumes:
-  pgdata:
-  minio_data:
+  mongodb_data:
