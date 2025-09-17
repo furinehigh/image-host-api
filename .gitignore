@@ -1,8 +1,47 @@
-/target
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
 .env
 .env.local
-config.local.toml
-/uploads
-/temp
+.env.production
+
+# Uploads
+/uploads/
+/backups/
+
+# Logs
 *.log
-.DS_Store
+logs/
+
+# Database
+*.db
+*.sqlite
+
+# SSL certificates
+nginx/ssl/
+*.pem
+*.key
+*.crt
+
+# Monitoring data
+monitoring/data/
+grafana/data/
+prometheus/data/
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/

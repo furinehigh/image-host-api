@@ -1,182 +1,162 @@
 use axum::{
-    async_trait,
-    extract::{FromRequestParts, State},
-    http::{header, request::Parts, StatusCode},
-    response::{IntoResponse, Response},
-    Json,
+    extract::{Request, State},
+    http::{header, StatusCode},
+    middleware::Next,
+    response::Response,
 };
-use serde_json::json;
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
+use chrono::{Duration, Utc};
 use crate::{
-    auth::{ApiKeyService, JwtService},
-    database::queries::{ApiKeyQueries, UserQueries},
-    errors::{AppError, Result},
     handlers::AppState,
-    models::{ApiKey, User},
+    error::{AppError, Result},
+    utils::crypto,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Claims {
+    pub sub: String, // user_id
+    pub exp: usize,  // expiration time
+    pub iat: usize,  // issued at
+    pub iss: String, // issuer
+}
+
+#[derive(Clone)]
+pub struct AuthLayer {
+    secret: String,
+}
+
+impl AuthLayer {
+    pub fn new() -> Self {
+        Self {
+            secret: std::env::var("JWT_SECRET").unwrap_or_else(|_| "default-secret".to_string()),
+        }
+    }
+
+    pub fn with_secret(secret: String) -> Self {
+        Self { secret }
+    }
+}
+
+// Extension trait to add user_id to request extensions
 pub struct AuthenticatedUser {
-    pub id: Uuid,
-    pub email: String,
-    pub is_admin: bool,
+    pub user_id: Uuid,
+    pub auth_method: AuthMethod,
 }
 
-#[derive(Debug, Clone)]
-pub struct AuthenticatedApiKey {
-    pub id: Uuid,
-    pub owner_id: Uuid,
-    pub limits: serde_json::Value,
+#[derive(Debug)]
+pub enum AuthMethod {
+    JWT,
+    ApiKey(String), // API key name
 }
 
-#[async_trait]
-impl FromRequestParts<AppState> for AuthenticatedUser {
-    type Rejection = Response;
+pub async fn auth_middleware(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> std::result::Result<Response, StatusCode> {
+    // Extract authorization header
+    let auth_header = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|header| header.to_str().ok());
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> std::result::Result<Self, Self::Rejection> {
-        // Try to get JWT token from Authorization header
-        let auth_header = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|header| header.to_str().ok());
-
-        if let Some(auth_header) = auth_header {
-            if let Some(token) = auth_header.strip_prefix("Bearer ") {
-                // Verify JWT token
-                let jwt_service = JwtService::new(&state.config.jwt_secret);
-                match jwt_service.verify_access_token(token) {
-                    Ok(claims) => {
-                        let user_id = Uuid::parse_str(&claims.sub)
-                            .map_err(|_| {
-                                (
-                                    StatusCode::UNAUTHORIZED,
-                                    Json(json!({"error": "Invalid token"})),
-                                ).into_response()
-                            })?;
-
-                        // Verify user still exists
-                        match UserQueries::find_by_id(state.database.pool(), user_id).await {
-                            Ok(Some(user)) => {
-                                return Ok(AuthenticatedUser {
-                                    id: user.id,
-                                    email: user.email,
-                                    is_admin: user.is_admin,
-                                });
-                            }
-                            Ok(None) => {
-                                return Err((
-                                    StatusCode::UNAUTHORIZED,
-                                    Json(json!({"error": "User not found"})),
-                                ).into_response());
-                            }
-                            Err(_) => {
-                                return Err((
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(json!({"error": "Database error"})),
-                                ).into_response());
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        return Err((
-                            StatusCode::UNAUTHORIZED,
-                            Json(json!({"error": "Invalid or expired token"})),
-                        ).into_response());
-                    }
+    let authenticated_user = match auth_header {
+        Some(auth_value) => {
+            if auth_value.starts_with("Bearer ") {
+                // JWT authentication
+                let token = &auth_value[7..];
+                match verify_jwt_token(token, &state.config.jwt_secret).await {
+                    Ok(user_id) => Some(AuthenticatedUser {
+                        user_id,
+                        auth_method: AuthMethod::JWT,
+                    }),
+                    Err(_) => None,
                 }
+            } else if auth_value.starts_with("ApiKey ") {
+                // API Key authentication
+                let api_key = &auth_value[7..];
+                match verify_api_key(api_key, &state).await {
+                    Ok((user_id, key_name)) => Some(AuthenticatedUser {
+                        user_id,
+                        auth_method: AuthMethod::ApiKey(key_name),
+                    }),
+                    Err(_) => None,
+                }
+            } else {
+                None
             }
         }
+        None => None,
+    };
 
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "Authentication required"})),
-        ).into_response())
+    match authenticated_user {
+        Some(user) => {
+            // Add user to request extensions
+            request.extensions_mut().insert(user);
+            Ok(next.run(request).await)
+        }
+        None => Err(StatusCode::UNAUTHORIZED),
     }
 }
 
-#[async_trait]
-impl FromRequestParts<AppState> for AuthenticatedApiKey {
-    type Rejection = Response;
+async fn verify_jwt_token(token: &str, secret: &str) -> Result<Uuid> {
+    let decoding_key = DecodingKey::from_secret(secret.as_ref());
+    let validation = Validation::default();
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> std::result::Result<Self, Self::Rejection> {
-        // Try Authorization header first
-        let api_key = if let Some(auth_header) = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|header| header.to_str().ok())
-        {
-            match ApiKeyService::extract_key_from_header(auth_header) {
-                Ok(key) => Some(key),
-                Err(_) => None,
-            }
-        } else {
-            // Try x-api-key header
-            parts
-                .headers
-                .get("x-api-key")
-                .and_then(|header| header.to_str().ok())
-                .and_then(|key| ApiKeyService::validate_api_key_format(key).ok().map(|_| key.to_string()))
-        };
+    let token_data = decode::<Claims>(token, &decoding_key, &validation)
+        .map_err(|_| AppError::Unauthorized)?;
 
-        if let Some(api_key) = api_key {
-            let key_hash = ApiKeyService::hash_api_key(&api_key);
-            
-            match ApiKeyQueries::find_by_key_hash(state.database.pool(), &key_hash).await {
-                Ok(Some(db_key)) => {
-                    // Check if API key has exceeded limits
-                    match ApiKeyQueries::check_limits(state.database.pool(), db_key.id).await {
-                        Ok((exceeded, limit_type, current, limit)) => {
-                            if exceeded && limit_type != "none" {
-                                return Err((
-                                    StatusCode::TOO_MANY_REQUESTS,
-                                    Json(json!({
-                                        "error": "Rate limit exceeded",
-                                        "limit_type": limit_type,
-                                        "current_usage": current,
-                                        "limit": limit
-                                    })),
-                                ).into_response());
-                            }
-                        }
-                        Err(_) => {
-                            return Err((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({"error": "Failed to check limits"})),
-                            ).into_response());
-                        }
-                    }
+    let user_id = Uuid::parse_str(&token_data.claims.sub)
+        .map_err(|_| AppError::Unauthorized)?;
 
-                    return Ok(AuthenticatedApiKey {
-                        id: db_key.id,
-                        owner_id: db_key.owner_id,
-                        limits: db_key.limits_json,
-                    });
-                }
-                Ok(None) => {
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        Json(json!({"error": "Invalid API key"})),
-                    ).into_response());
-                }
-                Err(_) => {
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "Database error"})),
-                    ).into_response());
-                }
-            }
+    Ok(user_id)
+}
+
+async fn verify_api_key(api_key: &str, state: &AppState) -> Result<(Uuid, String)> {
+    // Hash the provided API key
+    let key_hash = crypto::hash_api_key(api_key)?;
+
+    // Look up the API key in the database
+    let stored_key = state.database.get_api_key_by_hash(&key_hash).await?
+        .ok_or(AppError::Unauthorized)?;
+
+    // Check if key is expired
+    if let Some(expires_at) = stored_key.expires_at {
+        if expires_at < Utc::now() {
+            return Err(AppError::Unauthorized);
         }
-
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "API key required"})),
-        ).into_response())
     }
+
+    // Update last used timestamp
+    state.database.update_api_key_last_used(stored_key.id).await?;
+
+    Ok((stored_key.user_id, stored_key.name))
+}
+
+pub fn generate_jwt_token(user_id: Uuid, secret: &str, expires_in_hours: i64) -> Result<String> {
+    let now = Utc::now();
+    let expires_at = now + Duration::hours(expires_in_hours);
+
+    let claims = Claims {
+        sub: user_id.to_string(),
+        exp: expires_at.timestamp() as usize,
+        iat: now.timestamp() as usize,
+        iss: "image-hosting-server".to_string(),
+    };
+
+    let encoding_key = EncodingKey::from_secret(secret.as_ref());
+    let token = encode(&Header::default(), &claims, &encoding_key)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to generate JWT: {}", e)))?;
+
+    Ok(token)
+}
+
+// Helper function to extract authenticated user from request
+pub fn get_authenticated_user(request: &Request) -> Result<&AuthenticatedUser> {
+    request
+        .extensions()
+        .get::<AuthenticatedUser>()
+        .ok_or(AppError::Unauthorized)
 }

@@ -1,91 +1,43 @@
-use axum::Router;
-use utoipa::{
-    openapi::security::{ApiKey, ApiKeyValue, SecurityScheme},
-    Modify, OpenApi,
-};
+use axum::{routing::get, Router};
+use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-
-use crate::{
-    handlers::AppState,
-    models::*,
-};
+use crate::handlers::AppState;
 
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        crate::handlers::images::upload_image,
+        crate::handlers::health::health_check,
+        crate::handlers::upload::upload_image,
         crate::handlers::images::get_image,
+        crate::handlers::images::transform_image,
         crate::handlers::images::delete_image,
-        crate::handlers::images::get_metadata,
-        crate::handlers::auth::register,
-        crate::handlers::auth::login,
-        crate::handlers::auth::refresh,
-        crate::handlers::admin::create_api_key,
-        crate::handlers::admin::get_api_key,
-        crate::handlers::admin::get_usage,
-        crate::handlers::health::liveness,
-        crate::handlers::health::readiness,
+        crate::handlers::user::get_quota,
     ),
     components(
         schemas(
-            User,
-            CreateUserRequest,
-            LoginRequest,
-            AuthResponse,
-            UserResponse,
-            ApiKey,
-            CreateApiKeyRequest,
-            ApiKeyLimits,
-            RateLimits,
-            ApiKeyResponse,
-            Image,
-            UploadRequest,
-            Visibility,
-            ImageVariant,
-            ImageVariants,
-            UploadResponse,
-            ImageMetadata,
-            UsageCounter,
-            UsageQuery,
-            UsageResponse,
-            DailyUsage,
+            crate::models::ImageResponse,
+            crate::models::ImageTransformParams,
+            crate::models::UserQuotaResponse,
         )
     ),
     tags(
-        (name = "images", description = "Image upload and management endpoints"),
-        (name = "auth", description = "Authentication endpoints"),
-        (name = "admin", description = "Administrative endpoints"),
+        (name = "images", description = "Image management endpoints"),
+        (name = "user", description = "User management endpoints"),
         (name = "health", description = "Health check endpoints")
     ),
-    modifiers(&SecurityAddon)
+    info(
+        title = "Image Hosting API",
+        version = "1.0.0",
+        description = "A high-performance image hosting server with transformation capabilities",
+        contact(
+            name = "API Support",
+            email = "support@example.com"
+        )
+    )
 )]
 pub struct ApiDoc;
 
-struct SecurityAddon;
-
-impl Modify for SecurityAddon {
-    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        if let Some(components) = openapi.components.as_mut() {
-            components.add_security_scheme(
-                "api_key",
-                SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("x-api-key"))),
-            );
-            components.add_security_scheme(
-                "bearer_auth",
-                SecurityScheme::Http(
-                    utoipa::openapi::security::Http::new(
-                        utoipa::openapi::security::HttpAuthScheme::Bearer,
-                    )
-                    .bearer_format("JWT"),
-                ),
-            );
-        }
-    }
-}
-
-pub fn add_docs(app: Router<AppState>) -> Router<AppState> {
-    app.merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
-        .route("/openapi.json", axum::routing::get(|| async {
-            axum::Json(ApiDoc::openapi())
-        }))
+pub fn create_docs_router() -> Router<AppState> {
+    Router::new()
+        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
 }

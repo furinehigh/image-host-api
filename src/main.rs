@@ -1,31 +1,35 @@
+use anyhow::Result;
 use axum::{
     extract::DefaultBodyLimit,
-    http::StatusCode,
-    response::Json,
-    routing::{get, post},
+    http::{header, Method},
+    routing::{get, post, delete},
     Router,
+    middleware,
 };
 use std::net::SocketAddr;
 use tower::ServiceBuilder;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    compression::CompressionLayer,
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
 mod database;
-mod auth;
+mod error;
 mod handlers;
+mod middleware as app_middleware;
 mod models;
 mod services;
-mod middleware;
-mod storage;
-mod errors;
+mod utils;
 
 use config::Config;
 use database::Database;
 use services::redis::RedisService;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(
@@ -36,20 +40,21 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Load configuration
-    let config = Config::load()?;
-    tracing::info!("Starting image hosting server with config: {:?}", config);
-
+    let config = Config::from_env()?;
+    
+    // Create upload directory
+    utils::file::create_upload_directory(&config.upload_dir)?;
+    
+    // Initialize image processor
+    services::image_processor::ImageProcessor::init()?;
+    
     // Initialize database
     let database = Database::new(&config.database_url).await?;
     database.migrate().await?;
-
+    
     // Initialize Redis
     let redis = RedisService::new(&config.redis_url).await?;
-
-    // Initialize metrics
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .install_recorder()?;
-
+    
     // Build application state
     let app_state = handlers::AppState {
         database,
@@ -57,51 +62,55 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
     };
 
-    // Build router with rate limiting middleware
+    // Configure CORS
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        .allow_origin(Any);
+
+    // Build the application router
     let app = Router::new()
-        .route("/health/live", get(handlers::health::liveness))
-        .route("/health/ready", get(handlers::health::readiness))
-        .route("/metrics", get(move || async move { 
-            metrics_handle.render() 
-        }))
-        .route("/v1/uploads", post(handlers::images::upload_image))
-        .route("/v1/images/:id", get(handlers::images::get_image))
-        .route("/v1/images/:id", axum::routing::delete(handlers::images::delete_image))
-        .route("/v1/images/:id/metadata", get(handlers::images::get_metadata))
-        .layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            middleware::quota::quota_middleware,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            middleware::rate_limit::rate_limit_middleware,
-        ))
-        // Auth routes (no rate limiting needed for registration/login)
-        .route("/v1/auth/register", post(handlers::auth::register))
-        .route("/v1/auth/login", post(handlers::auth::login))
-        .route("/v1/auth/refresh", post(handlers::auth::refresh))
-        // Admin routes with different rate limits
-        .route("/v1/admin/keys", post(handlers::admin::create_api_key))
-        .route("/v1/admin/keys/:key", get(handlers::admin::get_api_key))
-        .route("/v1/admin/keys/:key", axum::routing::delete(handlers::admin::revoke_api_key))
-        .route("/v1/admin/usage", get(handlers::admin::get_usage))
-        .layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            middleware::rate_limit::admin_rate_limit_middleware,
-        ))
+        .route("/health", get(handlers::health::health_check))
+        .route("/api/v1/auth/register", post(handlers::auth::register))
+        .route("/api/v1/auth/login", post(handlers::auth::login))
+        .route("/api/v1/auth/refresh", post(handlers::auth::refresh_token))
+        .route("/api/v1/auth/api-keys", post(handlers::auth::create_api_key))
+        .route("/api/v1/auth/api-keys", get(handlers::auth::list_api_keys))
+        .route("/api/v1/auth/api-keys/:id", delete(handlers::auth::revoke_api_key))
+        // Protected routes
+        .route("/api/v1/upload", post(handlers::upload::upload_image))
+        .route("/api/v1/images", get(handlers::images::list_user_images))
+        .route("/api/v1/images/:id", get(handlers::images::get_image))
+        .route("/api/v1/images/:id/transform", get(handlers::images::transform_image))
+        .route("/api/v1/images/:id", delete(handlers::images::delete_image))
+        .route("/api/v1/user/quota", get(handlers::user::get_quota))
+        .route("/metrics", get(handlers::metrics::metrics))
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
-                .layer(CorsLayer::permissive())
-                .layer(DefaultBodyLimit::max(config.max_upload_size))
+                .layer(CompressionLayer::new())
+                .layer(cors)
+                .layer(DefaultBodyLimit::max(config.max_file_size))
+                .layer(middleware::from_fn_with_state(
+                    app_state.clone(),
+                    app_middleware::cache::cache_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    app_state.clone(),
+                    app_middleware::rate_limit::rate_limit_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    app_state.clone(),
+                    app_middleware::auth::auth_middleware,
+                ))
         )
         .with_state(app_state);
 
     // Add OpenAPI documentation
-    let app = handlers::docs::add_docs(app);
+    let app = app.merge(handlers::docs::create_docs_router());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    tracing::info!("Server listening on {}", addr);
+    tracing::info!("Server starting on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

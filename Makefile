@@ -1,70 +1,55 @@
-.PHONY: build test run docker-build docker-run clean migrate dev
+.PHONY: help build dev prod test clean backup restore logs
 
-# Build the application
+# Default target
+help:
+	@echo "Available commands:"
+	@echo "  dev      - Start development environment"
+	@echo "  prod     - Deploy production environment"
+	@echo "  build    - Build Docker images"
+	@echo "  test     - Run tests"
+	@echo "  clean    - Clean up Docker resources"
+	@echo "  backup   - Create backup of data"
+	@echo "  restore  - Restore from backup (usage: make restore TIMESTAMP=20231201_143000)"
+	@echo "  logs     - Show application logs"
+	@echo "  monitor  - Start with monitoring stack"
+
+# Development environment
+dev:
+	@chmod +x scripts/dev.sh
+	@./scripts/dev.sh
+
+# Production deployment
+prod:
+	@chmod +x scripts/deploy.sh
+	@./scripts/deploy.sh
+
+# Build images
 build:
-	cargo build --release
+	@docker-compose build
 
 # Run tests
 test:
-	cargo test
+	@docker-compose -f docker-compose.dev.yml run --rm app cargo test
 
-# Run the application in development mode
-dev:
-	cargo run
-
-# Run the application
-run: build
-	./target/release/image-hosting-server
-
-# Build Docker image
-docker-build:
-	docker build -t image-hosting-server .
-
-# Run with Docker Compose
-docker-run:
-	docker-compose up --build
-
-# Clean build artifacts
+# Clean up
 clean:
-	cargo clean
-	docker-compose down -v
+	@docker-compose down -v
+	@docker system prune -f
 
-# Run database migrations
-migrate:
-	sqlx migrate run
+# Backup
+backup:
+	@chmod +x scripts/backup.sh
+	@./scripts/backup.sh
 
-# Setup development environment
-setup-dev:
-	docker-compose up -d postgres redis minio
-	sleep 5
-	sqlx migrate run
+# Restore
+restore:
+	@chmod +x scripts/restore.sh
+	@./scripts/restore.sh $(TIMESTAMP)
 
-# Run integration tests
-test-integration:
-	docker-compose up -d postgres redis minio
-	sleep 5
-	sqlx migrate run
-	cargo test --test integration_tests
-	docker-compose down
+# Show logs
+logs:
+	@docker-compose logs -f app
 
-# Format code
-fmt:
-	cargo fmt
-
-# Run clippy linter
-lint:
-	cargo clippy -- -D warnings
-
-# Generate OpenAPI documentation
-docs:
-	cargo run --bin generate-openapi > openapi.json
-
-# Performance test with sample images
-perf-test:
-	./scripts/test-upload.sh $(API_KEY) test-images/sample1.jpg
-	./scripts/test-upload.sh $(API_KEY) test-images/sample2.png
-	./scripts/test-upload.sh $(API_KEY) test-images/sample3.webp
-
-# Create test API key
-create-test-key:
-	./scripts/create-api-key.sh $(ADMIN_TOKEN) "Test Key" 10000 300000
+# Start with monitoring
+monitor:
+	@docker-compose --profile monitoring up -d

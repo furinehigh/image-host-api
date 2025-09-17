@@ -1,59 +1,66 @@
-# Multi-stage build for Rust application
-FROM rust:latest as builder
+# Multi-stage build for optimized production image
+FROM rust:1.75-slim as builder
 
-# Install system dependencies
+# Install system dependencies for building
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     libpq-dev \
+    libvips-dev \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
 WORKDIR /app
 
-# Copy manifests
+# Copy manifests first for better layer caching
 COPY Cargo.toml Cargo.lock ./
+
+# Create a dummy main.rs to build dependencies
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+
+# Build dependencies (this layer will be cached unless Cargo.toml changes)
+RUN cargo build --release && rm -rf src
 
 # Copy source code
 COPY src ./src
 COPY migrations ./migrations
 
-ENV DATABASE_URL="postgresql://postgres:postgres@localhost:5432/image_hosting"
-
-
-# Build the application
+# Build the actual application
 RUN cargo build --release
 
-# Runtime stage
+# Runtime stage - minimal image
 FROM debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libpq5 \
+    libvips42 \
     libssl3 \
-    libvips-tools \
-    clamav \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-# Create app user
-RUN useradd -r -s /bin/false appuser
-
-# Create directories
-RUN mkdir -p /app /mnt/images && \
-    chown -R appuser:appuser /app /mnt/images
-
-# Copy binary from builder stage
-COPY --from=builder /app/target/release/image-hosting-server /app/
-
-# Copy configuration
-COPY config.toml /app/
-
-# Switch to app user
-USER appuser
+# Create non-root user for security
+RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 WORKDIR /app
 
+# Copy the binary from builder stage
+COPY --from=builder /app/target/release/image-hosting-server /app/
+COPY --from=builder /app/migrations /app/migrations
+
+# Create uploads directory with proper permissions
+RUN mkdir -p /app/uploads && chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Expose port
 EXPOSE 3000
 
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# Run the binary
 CMD ["./image-hosting-server"]

@@ -1,195 +1,202 @@
 use axum::{
     extract::{Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{StatusCode, HeaderMap},
     middleware::Next,
-    response::{IntoResponse, Response},
-    Json,
+    response::Response,
 };
-use serde_json::json;
-
+use std::time::Duration;
+use std::net::IpAddr;
 use crate::{
-    errors::AppError,
     handlers::AppState,
-    middleware::auth::{AuthenticatedApiKey, AuthenticatedUser},
-    models::ApiKeyLimits,
-    services::rate_limiter::RateLimiter,
+    error::AppError,
+    middleware::auth::{get_authenticated_user, AuthenticatedUser},
 };
+
+#[derive(Clone)]
+pub struct RateLimitLayer {
+    requests_per_window: u32,
+    window_duration: Duration,
+}
+
+impl RateLimitLayer {
+    pub fn new() -> Self {
+        Self {
+            requests_per_window: 100, // Default: 100 requests per hour
+            window_duration: Duration::from_secs(3600), // 1 hour
+        }
+    }
+
+    pub fn with_limits(requests: u32, window_seconds: u64) -> Self {
+        Self {
+            requests_per_window: requests,
+            window_duration: Duration::from_secs(window_seconds),
+        }
+    }
+}
 
 pub async fn rate_limit_middleware(
     State(state): State<AppState>,
-    api_key: AuthenticatedApiKey,
-    request: Request,
+    headers: HeaderMap,
+    mut request: Request,
     next: Next,
-) -> Result<Response, Response> {
-    // Parse API key limits
-    let limits: ApiKeyLimits = serde_json::from_value(api_key.limits.clone())
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Failed to parse API key limits"})),
-            ).into_response()
-        })?;
+) -> Result<Response, StatusCode> {
+    // Determine rate limit key based on authentication status
+    let rate_limit_key = if let Ok(user) = get_authenticated_user(&request) {
+        // Authenticated users get per-user rate limiting
+        format!("user:{}", user.user_id)
+    } else {
+        // Anonymous users get per-IP rate limiting
+        let ip = extract_client_ip(&headers, &request)
+            .unwrap_or_else(|| "unknown".to_string());
+        format!("ip:{}", ip)
+    };
 
-    let rate_limiter = RateLimiter::new(state.redis.clone());
+    // Check rate limit
+    let allowed = state.redis.check_rate_limit(
+        &rate_limit_key,
+        state.config.rate_limit_requests,
+        Duration::from_secs(state.config.rate_limit_window),
+    ).await.unwrap_or(false);
 
-    // Check rate limits in order of strictness (minute -> hour -> day)
-    let rate_checks = [
-        ("minute", limits.rate_limits.requests_per_minute, limits.rate_limits.requests_per_minute),
-        ("hour", limits.rate_limits.requests_per_hour, limits.rate_limits.requests_per_hour / 60), // refill rate per minute
-        ("day", limits.rate_limits.requests_per_day, limits.rate_limits.requests_per_day / (24 * 60)), // refill rate per minute
-    ];
-
-    for (limit_type, capacity, refill_rate) in rate_checks {
-        match rate_limiter.check_rate_limit(api_key.id, limit_type, capacity, refill_rate).await {
-            Ok(result) => {
-                if !result.allowed {
-                    let mut headers = HeaderMap::new();
-                    headers.insert("X-RateLimit-Limit", capacity.to_string().parse().unwrap());
-                    headers.insert("X-RateLimit-Remaining", result.remaining_tokens.to_string().parse().unwrap());
-                    headers.insert("X-RateLimit-Reset", result.reset_time.to_string().parse().unwrap());
-                    headers.insert("Retry-After", "60".parse().unwrap()); // Retry after 1 minute
-
-                    return Err((
-                        StatusCode::TOO_MANY_REQUESTS,
-                        headers,
-                        Json(json!({
-                            "error": "Rate limit exceeded",
-                            "limit_type": limit_type,
-                            "limit": capacity,
-                            "remaining": result.remaining_tokens,
-                            "reset_time": result.reset_time,
-                            "retry_after": 60
-                        })),
-                    ).into_response());
-                }
-
-                // Add rate limit headers to successful responses
-                let response = next.run(request).await;
-                let mut response = response;
-                let headers = response.headers_mut();
-                
-                headers.insert("X-RateLimit-Limit", capacity.to_string().parse().unwrap());
-                headers.insert("X-RateLimit-Remaining", result.remaining_tokens.to_string().parse().unwrap());
-                headers.insert("X-RateLimit-Reset", result.reset_time.to_string().parse().unwrap());
-
-                return Ok(response);
-            }
-            Err(e) => {
-                // Log error but don't block request on rate limiter failure
-                tracing::warn!("Rate limiter check failed for API key {}: {}", api_key.id, e);
-            }
-        }
+    if !allowed {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    // If all rate limit checks pass or fail, continue with request
-    Ok(next.run(request).await)
-}
-
-pub async fn admin_rate_limit_middleware(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    request: Request,
-    next: Next,
-) -> Result<Response, Response> {
-    // Admin endpoints have more generous rate limits
-    let rate_limiter = RateLimiter::new(state.redis.clone());
-
-    // Admin rate limits (higher than regular API keys)
-    let admin_limits = [
-        ("minute", 200u32, 200u32),   // 200 requests per minute
-        ("hour", 5000u32, 5000u32),   // 5000 requests per hour
-        ("day", 50000u32, 50000u32),  // 50000 requests per day
-    ];
-
-    for (limit_type, capacity, refill_rate) in admin_limits {
-        let key = format!("admin_{}", user.id);
-        match rate_limiter.check_rate_limit(
-            uuid::Uuid::parse_str(&key).unwrap_or(user.id),
-            limit_type,
-            capacity,
-            refill_rate,
-        ).await {
-            Ok(result) => {
-                if !result.allowed {
-                    let mut headers = HeaderMap::new();
-                    headers.insert("X-RateLimit-Limit", capacity.to_string().parse().unwrap());
-                    headers.insert("X-RateLimit-Remaining", result.remaining_tokens.to_string().parse().unwrap());
-                    headers.insert("X-RateLimit-Reset", result.reset_time.to_string().parse().unwrap());
-
-                    return Err((
-                        StatusCode::TOO_MANY_REQUESTS,
-                        headers,
-                        Json(json!({
-                            "error": "Admin rate limit exceeded",
-                            "limit_type": limit_type,
-                            "limit": capacity,
-                            "remaining": result.remaining_tokens,
-                            "reset_time": result.reset_time
-                        })),
-                    ).into_response());
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Admin rate limiter check failed for user {}: {}", user.id, e);
-            }
-        }
-    }
-
-    Ok(next.run(request).await)
-}
-
-// Middleware for endpoints that don't require authentication but still need basic rate limiting
-pub async fn public_rate_limit_middleware(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Result<Response, Response> {
-    let rate_limiter = RateLimiter::new(state.redis.clone());
+    // Add rate limit info to response headers
+    let mut response = next.run(request).await;
     
-    // Use IP address for rate limiting public endpoints
-    let client_ip = request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|hv| hv.to_str().ok())
-        .or_else(|| {
-            request
-                .headers()
-                .get("x-real-ip")
-                .and_then(|hv| hv.to_str().ok())
-        })
-        .unwrap_or("unknown")
-        .to_string();
+    // Get current count for headers
+    if let Ok(current_count) = get_current_rate_limit_count(&state, &rate_limit_key).await {
+        let headers = response.headers_mut();
+        headers.insert("X-RateLimit-Limit", state.config.rate_limit_requests.into());
+        headers.insert("X-RateLimit-Remaining", (state.config.rate_limit_requests.saturating_sub(current_count)).into());
+        headers.insert("X-RateLimit-Reset", (chrono::Utc::now().timestamp() + state.config.rate_limit_window as i64).into());
+    }
 
-    // Generate a UUID from the IP for consistency with rate limiter
-    let ip_uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, client_ip.as_bytes());
+    Ok(response)
+}
 
-    // Public endpoints have strict rate limits
-    let public_limits = [
-        ("minute", 10u32, 10u32),   // 10 requests per minute per IP
-        ("hour", 100u32, 100u32),   // 100 requests per hour per IP
+fn extract_client_ip(headers: &HeaderMap, request: &Request) -> Option<String> {
+    // Try various headers for real IP (in order of preference)
+    let ip_headers = [
+        "CF-Connecting-IP",      // Cloudflare
+        "X-Real-IP",             // Nginx
+        "X-Forwarded-For",       // Standard proxy header
+        "X-Client-IP",           // Apache
+        "X-Cluster-Client-IP",   // Cluster
     ];
 
-    for (limit_type, capacity, refill_rate) in public_limits {
-        match rate_limiter.check_rate_limit(ip_uuid, limit_type, capacity, refill_rate).await {
-            Ok(result) => {
-                if !result.allowed {
-                    return Err((
-                        StatusCode::TOO_MANY_REQUESTS,
-                        Json(json!({
-                            "error": "Rate limit exceeded for public endpoint",
-                            "limit_type": limit_type,
-                            "limit": capacity,
-                            "remaining": result.remaining_tokens,
-                            "reset_time": result.reset_time
-                        })),
-                    ).into_response());
+    for header_name in &ip_headers {
+        if let Some(header_value) = headers.get(*header_name) {
+            if let Ok(ip_str) = header_value.to_str() {
+                // X-Forwarded-For can contain multiple IPs, take the first one
+                let ip = ip_str.split(',').next().unwrap_or(ip_str).trim();
+                if let Ok(_) = ip.parse::<IpAddr>() {
+                    return Some(ip.to_string());
                 }
-            }
-            Err(e) => {
-                tracing::warn!("Public rate limiter check failed for IP {}: {}", client_ip, e);
             }
         }
     }
 
-    Ok(next.run(request).await)
+    // Fallback to connection remote addr
+    None // In a real implementation, you'd extract this from the connection
+}
+
+async fn get_current_rate_limit_count(state: &AppState, key: &str) -> Result<u32, AppError> {
+    let mut conn = state.redis.get_connection()?;
+    let count: u32 = redis::Commands::get(&mut conn, key).unwrap_or(0);
+    Ok(count)
+}
+
+// Specialized rate limiters for different endpoints
+pub struct EndpointRateLimiter;
+
+impl EndpointRateLimiter {
+    // Upload endpoint - more restrictive
+    pub async fn check_upload_limit(state: &AppState, user_id: &str) -> Result<bool, AppError> {
+        let key = format!("upload:user:{}", user_id);
+        let allowed = state.redis.check_rate_limit(
+            &key,
+            10, // 10 uploads per hour
+            Duration::from_secs(3600),
+        ).await?;
+        Ok(allowed)
+    }
+
+    // Transform endpoint - moderate limits
+    pub async fn check_transform_limit(state: &AppState, user_id: &str) -> Result<bool, AppError> {
+        let key = format!("transform:user:{}", user_id);
+        let allowed = state.redis.check_rate_limit(
+            &key,
+            100, // 100 transforms per hour
+            Duration::from_secs(3600),
+        ).await?;
+        Ok(allowed)
+    }
+
+    // Auth endpoints - prevent brute force
+    pub async fn check_auth_limit(state: &AppState, ip: &str) -> Result<bool, AppError> {
+        let key = format!("auth:ip:{}", ip);
+        let allowed = state.redis.check_rate_limit(
+            &key,
+            5, // 5 auth attempts per 15 minutes
+            Duration::from_secs(900),
+        ).await?;
+        Ok(allowed)
+    }
+}
+
+// Sliding window rate limiter for more precise control
+pub struct SlidingWindowRateLimiter {
+    redis: crate::services::redis::RedisService,
+}
+
+impl SlidingWindowRateLimiter {
+    pub fn new(redis: crate::services::redis::RedisService) -> Self {
+        Self { redis }
+    }
+
+    pub async fn check_limit(
+        &self,
+        key: &str,
+        limit: u32,
+        window_seconds: u64,
+    ) -> Result<bool, AppError> {
+        let mut conn = self.redis.get_connection()?;
+        let now = chrono::Utc::now().timestamp();
+        let window_start = now - window_seconds as i64;
+
+        // Use Redis sorted set for sliding window
+        let script = r#"
+            local key = KEYS[1]
+            local now = tonumber(ARGV[1])
+            local window_start = tonumber(ARGV[2])
+            local limit = tonumber(ARGV[3])
+            
+            -- Remove old entries
+            redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
+            
+            -- Count current entries
+            local current = redis.call('ZCARD', key)
+            
+            if current < limit then
+                -- Add current request
+                redis.call('ZADD', key, now, now)
+                redis.call('EXPIRE', key, ARGV[4])
+                return 1
+            else
+                return 0
+            end
+        "#;
+
+        let result: i32 = redis::Script::new(script)
+            .key(key)
+            .arg(now)
+            .arg(window_start)
+            .arg(limit)
+            .arg(window_seconds)
+            .invoke(&mut conn)?;
+
+        Ok(result == 1)
+    }
 }

@@ -1,501 +1,384 @@
-use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::process::Command;
-use tokio::{fs, sync::mpsc, task::JoinHandle};
-use uuid::Uuid;
+use image::{ImageFormat, DynamicImage, ImageError};
+use std::io::Cursor;
+use crate::models::ImageTransformParams;
+use crate::error::{AppError, Result};
 
-use crate::{
-    config::ImageProcessingConfig,
-    database::queries::ImageQueries,
-    errors::{AppError, Result},
-    models::ImageVariant,
-    storage::Storage,
-};
+#[cfg(feature = "libvips")]
+use libvips::{VipsApp, VipsImage};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcessingJob {
-    pub id: Uuid,
-    pub image_id: Uuid,
-    pub job_type: ProcessingJobType,
-    pub parameters: ProcessingParameters,
-    pub status: JobStatus,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub error_message: Option<String>,
-    pub retry_count: u32,
+pub struct ImageProcessor;
+
+pub struct ImageInfo {
+    pub width: u32,
+    pub height: u32,
+    pub format: ImageFormat,
+    pub has_transparency: bool,
+    pub color_space: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ProcessingJobType {
-    GenerateVariants,
-    Resize,
-    Convert,
-    Optimize,
+pub struct ProcessingOptions {
+    pub optimize: bool,
+    pub strip_metadata: bool,
+    pub progressive: bool,
+    pub quality: u8,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcessingParameters {
-    pub original_path: String,
-    pub output_dir: String,
-    pub thumbnail_sizes: Vec<u32>,
-    pub generate_webp: bool,
-    pub generate_avif: bool,
-    pub custom_sizes: Vec<u32>,
-    pub quality_webp: u8,
-    pub quality_avif: u8,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum JobStatus {
-    Queued,
-    Processing,
-    Completed,
-    Failed,
-    Retrying,
-}
-
-pub struct ImageProcessor {
-    config: ImageProcessingConfig,
-    job_sender: mpsc::UnboundedSender<ProcessingJob>,
-    worker_handles: Vec<JoinHandle<()>>,
+impl Default for ProcessingOptions {
+    fn default() -> Self {
+        Self {
+            optimize: true,
+            strip_metadata: true,
+            progressive: true,
+            quality: 85,
+        }
+    }
 }
 
 impl ImageProcessor {
-    pub fn new(config: &ImageProcessingConfig) -> Self {
-        let (job_sender, job_receiver) = mpsc::unbounded_channel();
-        let mut worker_handles = Vec::new();
-
-        // Spawn worker tasks
-        for worker_id in 0..config.max_workers {
-            let worker_config = config.clone();
-            let mut receiver = job_receiver.clone();
-            
-            let handle = tokio::spawn(async move {
-                Self::worker_loop(worker_id, worker_config, receiver).await;
-            });
-            
-            worker_handles.push(handle);
+    pub fn init() -> Result<()> {
+        #[cfg(feature = "libvips")]
+        {
+            VipsApp::new("image-hosting-server", false)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to initialize libvips: {}", e)))?;
         }
+        Ok(())
+    }
 
-        Self {
-            config: config.clone(),
-            job_sender,
-            worker_handles,
+    pub fn get_image_info(data: &[u8]) -> Result<ImageInfo> {
+        #[cfg(feature = "libvips")]
+        {
+            Self::get_image_info_vips(data)
+        }
+        #[cfg(not(feature = "libvips"))]
+        {
+            Self::get_image_info_fallback(data)
         }
     }
 
-    pub async fn queue_processing_job(
-        &self,
-        image_id: Uuid,
-        original_path: String,
-        thumbnail_sizes: Vec<u32>,
-        custom_sizes: Vec<u32>,
-    ) -> Result<ProcessingJob> {
-        let job_id = Uuid::new_v4();
-        let output_dir = format!("processed/{}", image_id);
+    #[cfg(feature = "libvips")]
+    fn get_image_info_vips(data: &[u8]) -> Result<ImageInfo> {
+        let img = VipsImage::new_from_buffer(data, "")
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("libvips error: {}", e)))?;
 
-        let job = ProcessingJob {
-            id: job_id,
-            image_id,
-            job_type: ProcessingJobType::GenerateVariants,
-            parameters: ProcessingParameters {
-                original_path,
-                output_dir,
-                thumbnail_sizes,
-                generate_webp: true,
-                generate_avif: true,
-                custom_sizes,
-                quality_webp: self.config.quality_webp,
-                quality_avif: self.config.quality_avif,
-            },
-            status: JobStatus::Queued,
-            created_at: chrono::Utc::now(),
-            started_at: None,
-            completed_at: None,
-            error_message: None,
-            retry_count: 0,
+        let width = img.get_width() as u32;
+        let height = img.get_height() as u32;
+        let bands = img.get_bands();
+        let has_transparency = bands == 4 || bands == 2; // RGBA or GA
+        
+        let format = Self::detect_format_from_data(data)?;
+        let color_space = img.get_interpretation().to_string();
+
+        Ok(ImageInfo {
+            width,
+            height,
+            format,
+            has_transparency,
+            color_space,
+        })
+    }
+
+    #[cfg(not(feature = "libvips"))]
+    fn get_image_info_fallback(data: &[u8]) -> Result<ImageInfo> {
+        let img = image::load_from_memory(data)
+            .map_err(|_| AppError::InvalidFileFormat)?;
+        
+        let format = image::guess_format(data)
+            .map_err(|_| AppError::InvalidFileFormat)?;
+
+        let has_transparency = match img.color() {
+            image::ColorType::Rgba8 | image::ColorType::Rgba16 | 
+            image::ColorType::La8 | image::ColorType::La16 => true,
+            _ => false,
         };
 
-        self.job_sender.send(job.clone())
-            .map_err(|_| AppError::Internal(anyhow::anyhow!("Failed to queue processing job")))?;
-
-        tracing::info!("Queued processing job {} for image {}", job_id, image_id);
-        Ok(job)
+        Ok(ImageInfo {
+            width: img.width(),
+            height: img.height(),
+            format,
+            has_transparency,
+            color_space: format!("{:?}", img.color()),
+        })
     }
 
-    async fn worker_loop(
-        worker_id: usize,
-        config: ImageProcessingConfig,
-        mut receiver: mpsc::UnboundedReceiver<ProcessingJob>,
-    ) {
-        tracing::info!("Image processing worker {} started", worker_id);
+    pub fn transform_image(data: &[u8], params: &ImageTransformParams) -> Result<Vec<u8>> {
+        #[cfg(feature = "libvips")]
+        {
+            Self::transform_image_vips(data, params)
+        }
+        #[cfg(not(feature = "libvips"))]
+        {
+            Self::transform_image_fallback(data, params)
+        }
+    }
 
-        while let Some(mut job) = receiver.recv().await {
-            tracing::info!("Worker {} processing job {}", worker_id, job.id);
+    #[cfg(feature = "libvips")]
+    fn transform_image_vips(data: &[u8], params: &ImageTransformParams) -> Result<Vec<u8>> {
+        let mut img = VipsImage::new_from_buffer(data, "")
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("libvips error: {}", e)))?;
+
+        // Auto-rotate based on EXIF orientation
+        img = img.autorot()
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("libvips autorot error: {}", e)))?;
+
+        // Resize if dimensions are specified
+        if let (Some(width), Some(height)) = (params.width, params.height) {
+            let scale_x = width as f64 / img.get_width() as f64;
+            let scale_y = height as f64 / img.get_height() as f64;
+            let scale = scale_x.min(scale_y);
             
-            job.status = JobStatus::Processing;
-            job.started_at = Some(chrono::Utc::now());
+            img = img.resize(scale)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("libvips resize error: {}", e)))?;
+        } else if let Some(width) = params.width {
+            let scale = width as f64 / img.get_width() as f64;
+            img = img.resize(scale)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("libvips resize error: {}", e)))?;
+        } else if let Some(height) = params.height {
+            let scale = height as f64 / img.get_height() as f64;
+            img = img.resize(scale)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("libvips resize error: {}", e)))?;
+        }
 
-            match Self::process_job(&config, &job).await {
-                Ok(variants) => {
-                    job.status = JobStatus::Completed;
-                    job.completed_at = Some(chrono::Utc::now());
-                    
-                    // TODO: Update database with generated variants
-                    tracing::info!("Job {} completed successfully with {} variants", job.id, variants.len());
+        // Determine output format and options
+        let (format_str, options) = match params.format.as_deref() {
+            Some("webp") => {
+                let quality = params.quality.unwrap_or(85);
+                ("webp", format!("[Q={}]", quality))
+            }
+            Some("png") => ("png", "[compression=6]".to_string()),
+            Some("jpeg") | Some("jpg") => {
+                let quality = params.quality.unwrap_or(85);
+                ("jpeg", format!("[Q={},optimize_coding=true,strip=true]", quality))
+            }
+            _ => {
+                let quality = params.quality.unwrap_or(85);
+                ("jpeg", format!("[Q={},optimize_coding=true,strip=true]", quality))
+            }
+        };
+
+        // Convert to buffer
+        let buffer = img.write_to_buffer(&format!(".{}{}", format_str, options))
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("libvips write error: {}", e)))?;
+
+        Ok(buffer)
+    }
+
+    #[cfg(not(feature = "libvips"))]
+    fn transform_image_fallback(data: &[u8], params: &ImageTransformParams) -> Result<Vec<u8>> {
+        let mut img = image::load_from_memory(data)
+            .map_err(|_| AppError::InvalidFileFormat)?;
+
+        // Resize if dimensions are specified
+        if let (Some(width), Some(height)) = (params.width, params.height) {
+            img = img.resize(width, height, image::imageops::FilterType::Lanczos3);
+        } else if let Some(width) = params.width {
+            let height = (img.height() as f32 * width as f32 / img.width() as f32) as u32;
+            img = img.resize(width, height, image::imageops::FilterType::Lanczos3);
+        } else if let Some(height) = params.height {
+            let width = (img.width() as f32 * height as f32 / img.height() as f32) as u32;
+            img = img.resize(width, height, image::imageops::FilterType::Lanczos3);
+        }
+
+        // Determine output format
+        let format = match params.format.as_deref() {
+            Some("webp") => ImageFormat::WebP,
+            Some("png") => ImageFormat::Png,
+            Some("jpeg") | Some("jpg") => ImageFormat::Jpeg,
+            _ => ImageFormat::Jpeg,
+        };
+
+        // Encode image
+        let mut output = Vec::new();
+        let mut cursor = Cursor::new(&mut output);
+        
+        match format {
+            ImageFormat::Jpeg => {
+                let quality = params.quality.unwrap_or(85);
+                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
+                img.write_with_encoder(encoder)
+                    .map_err(|e| AppError::ImageProcessing(e))?;
+            }
+            _ => {
+                img.write_to(&mut cursor, format)
+                    .map_err(|e| AppError::ImageProcessing(e))?;
+            }
+        }
+
+        Ok(output)
+    }
+
+    pub fn optimize_image(data: &[u8], options: &ProcessingOptions) -> Result<Vec<u8>> {
+        #[cfg(feature = "libvips")]
+        {
+            Self::optimize_image_vips(data, options)
+        }
+        #[cfg(not(feature = "libvips"))]
+        {
+            Self::optimize_image_fallback(data, options)
+        }
+    }
+
+    #[cfg(feature = "libvips")]
+    fn optimize_image_vips(data: &[u8], options: &ProcessingOptions) -> Result<Vec<u8>> {
+        let mut img = VipsImage::new_from_buffer(data, "")
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("libvips error: {}", e)))?;
+
+        // Auto-rotate and strip metadata if requested
+        if options.strip_metadata {
+            img = img.autorot()
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("libvips autorot error: {}", e)))?;
+        }
+
+        // Detect original format
+        let format = Self::detect_format_from_data(data)?;
+        
+        let (format_str, format_options) = match format {
+            ImageFormat::Jpeg => {
+                let mut opts = format!("[Q={}]", options.quality);
+                if options.optimize {
+                    opts = format!("[Q={},optimize_coding=true]", options.quality);
                 }
-                Err(e) => {
-                    job.status = JobStatus::Failed;
-                    job.error_message = Some(e.to_string());
-                    job.retry_count += 1;
-                    
-                    tracing::error!("Job {} failed: {}", job.id, e);
-                    
-                    // Retry logic
-                    if job.retry_count < 3 {
-                        job.status = JobStatus::Retrying;
-                        tokio::time::sleep(tokio::time::Duration::from_secs(job.retry_count as u64 * 10)).await;
-                        
-                        // Re-queue the job
-                        // In a real implementation, you'd use a proper job queue with retry logic
-                        tracing::info!("Retrying job {} (attempt {})", job.id, job.retry_count + 1);
+                if options.strip_metadata {
+                    opts = format!("[Q={},optimize_coding=true,strip=true]", options.quality);
+                }
+                if options.progressive {
+                    opts = format!("[Q={},optimize_coding=true,strip=true,interlace=true]", options.quality);
+                }
+                ("jpeg", opts)
+            }
+            ImageFormat::Png => {
+                let compression = if options.optimize { 9 } else { 6 };
+                ("png", format!("[compression={}]", compression))
+            }
+            ImageFormat::WebP => {
+                ("webp", format!("[Q={}]", options.quality))
+            }
+            _ => ("jpeg", format!("[Q={},optimize_coding=true,strip=true]", options.quality))
+        };
+
+        let buffer = img.write_to_buffer(&format!(".{}{}", format_str, format_options))
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("libvips write error: {}", e)))?;
+
+        Ok(buffer)
+    }
+
+    #[cfg(not(feature = "libvips"))]
+    fn optimize_image_fallback(data: &[u8], options: &ProcessingOptions) -> Result<Vec<u8>> {
+        let img = image::load_from_memory(data)
+            .map_err(|_| AppError::InvalidFileFormat)?;
+
+        let format = image::guess_format(data)
+            .map_err(|_| AppError::InvalidFileFormat)?;
+
+        let mut output = Vec::new();
+        let mut cursor = Cursor::new(&mut output);
+
+        match format {
+            ImageFormat::Jpeg => {
+                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, options.quality);
+                img.write_with_encoder(encoder)
+                    .map_err(|e| AppError::ImageProcessing(e))?;
+            }
+            ImageFormat::Png => {
+                let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
+                img.write_with_encoder(encoder)
+                    .map_err(|e| AppError::ImageProcessing(e))?;
+            }
+            _ => {
+                img.write_to(&mut cursor, format)
+                    .map_err(|e| AppError::ImageProcessing(e))?;
+            }
+        }
+
+        Ok(output)
+    }
+
+    pub fn validate_image(data: &[u8], max_dimension: u32, max_file_size: usize) -> Result<()> {
+        if data.len() > max_file_size {
+            return Err(AppError::FileTooLarge);
+        }
+
+        let info = Self::get_image_info(data)?;
+        
+        if info.width > max_dimension || info.height > max_dimension {
+            return Err(AppError::ImageTooLarge);
+        }
+
+        // Additional validation for suspicious files
+        if info.width == 0 || info.height == 0 {
+            return Err(AppError::InvalidFileFormat);
+        }
+
+        // Check for reasonable aspect ratio (prevent extremely thin images)
+        let aspect_ratio = info.width as f32 / info.height as f32;
+        if aspect_ratio > 100.0 || aspect_ratio < 0.01 {
+            return Err(AppError::InvalidFileFormat);
+        }
+
+        Ok(())
+    }
+
+    pub fn generate_thumbnail(data: &[u8], size: u32) -> Result<Vec<u8>> {
+        let params = ImageTransformParams {
+            width: Some(size),
+            height: Some(size),
+            quality: Some(85),
+            format: Some("jpeg".to_string()),
+        };
+
+        Self::transform_image(data, &params)
+    }
+
+    pub fn detect_format_from_data(data: &[u8]) -> Result<ImageFormat> {
+        image::guess_format(data).map_err(|_| AppError::InvalidFileFormat)
+    }
+
+    pub fn is_animated(data: &[u8]) -> Result<bool> {
+        // Simple check for animated GIF
+        if data.len() > 6 && &data[0..6] == b"GIF89a" {
+            // Look for multiple image descriptors (simplified check)
+            let mut count = 0;
+            let mut pos = 6;
+            
+            while pos < data.len() - 1 {
+                if data[pos] == 0x21 && data[pos + 1] == 0xF9 {
+                    count += 1;
+                    if count > 1 {
+                        return Ok(true);
                     }
                 }
+                pos += 1;
             }
         }
-
-        tracing::info!("Image processing worker {} stopped", worker_id);
-    }
-
-    async fn process_job(
-        config: &ImageProcessingConfig,
-        job: &ProcessingJob,
-    ) -> Result<Vec<ImageVariant>> {
-        let mut variants = Vec::new();
-        let params = &job.parameters;
-
-        // Create output directory
-        fs::create_dir_all(&params.output_dir).await
-            .map_err(|e| AppError::FileProcessing(format!("Failed to create output directory: {}", e)))?;
-
-        // Generate thumbnails
-        for &size in &params.thumbnail_sizes {
-            let output_path = format!("{}/thumb_{}px.webp", params.output_dir, size);
-            
-            Self::resize_image(
-                config,
-                &params.original_path,
-                &output_path,
-                Some(size),
-                None,
-                "webp",
-                params.quality_webp,
-            ).await?;
-
-            // Get dimensions of generated thumbnail
-            let (width, height) = Self::get_image_dimensions(&output_path).await?;
-            let size_bytes = fs::metadata(&output_path).await?.len();
-
-            variants.push(ImageVariant {
-                width,
-                height,
-                format: "image/webp".to_string(),
-                size_bytes,
-                url: format!("/v1/images/{}/thumb_{}px.webp", job.image_id, size),
-            });
-        }
-
-        // Generate custom sizes
-        for &size in &params.custom_sizes {
-            let output_path = format!("{}/custom_{}px.webp", params.output_dir, size);
-            
-            Self::resize_image(
-                config,
-                &params.original_path,
-                &output_path,
-                Some(size),
-                None,
-                "webp",
-                params.quality_webp,
-            ).await?;
-
-            let (width, height) = Self::get_image_dimensions(&output_path).await?;
-            let size_bytes = fs::metadata(&output_path).await?.len();
-
-            variants.push(ImageVariant {
-                width,
-                height,
-                format: "image/webp".to_string(),
-                size_bytes,
-                url: format!("/v1/images/{}/custom_{}px.webp", job.image_id, size),
-            });
-        }
-
-        // Generate WebP version
-        if params.generate_webp {
-            let output_path = format!("{}/optimized.webp", params.output_dir);
-            
-            Self::convert_format(
-                config,
-                &params.original_path,
-                &output_path,
-                "webp",
-                params.quality_webp,
-            ).await?;
-
-            let (width, height) = Self::get_image_dimensions(&output_path).await?;
-            let size_bytes = fs::metadata(&output_path).await?.len();
-
-            variants.push(ImageVariant {
-                width,
-                height,
-                format: "image/webp".to_string(),
-                size_bytes,
-                url: format!("/v1/images/{}/optimized.webp", job.image_id),
-            });
-        }
-
-        // Generate AVIF version
-        if params.generate_avif {
-            let output_path = format!("{}/optimized.avif", params.output_dir);
-            
-            Self::convert_format(
-                config,
-                &params.original_path,
-                &output_path,
-                "avif",
-                params.quality_avif,
-            ).await?;
-
-            let (width, height) = Self::get_image_dimensions(&output_path).await?;
-            let size_bytes = fs::metadata(&output_path).await?.len();
-
-            variants.push(ImageVariant {
-                width,
-                height,
-                format: "image/avif".to_string(),
-                size_bytes,
-                url: format!("/v1/images/{}/optimized.avif", job.image_id),
-            });
-        }
-
-        Ok(variants)
-    }
-
-    async fn resize_image(
-        config: &ImageProcessingConfig,
-        input_path: &str,
-        output_path: &str,
-        width: Option<u32>,
-        height: Option<u32>,
-        format: &str,
-        quality: u8,
-    ) -> Result<()> {
-        if config.use_vips {
-            Self::resize_with_vips(config, input_path, output_path, width, height, format, quality).await
-        } else {
-            Self::resize_with_image_crate(input_path, output_path, width, height).await
-        }
-    }
-
-    async fn resize_with_vips(
-        config: &ImageProcessingConfig,
-        input_path: &str,
-        output_path: &str,
-        width: Option<u32>,
-        height: Option<u32>,
-        format: &str,
-        quality: u8,
-    ) -> Result<()> {
-        let mut cmd = Command::new(&config.vips_path);
-
-        // Build vips command
-        if let Some(w) = width {
-            if let Some(h) = height {
-                // Resize to exact dimensions
-                cmd.arg("resize")
-                    .arg(input_path)
-                    .arg(output_path)
-                    .arg(format!("{}x{}", w, h));
-            } else {
-                // Resize by width, maintain aspect ratio
-                cmd.arg("resize")
-                    .arg(input_path)
-                    .arg(output_path)
-                    .arg(w.to_string());
-            }
-        } else {
-            // Just convert format
-            cmd.arg("copy")
-                .arg(input_path);
-            
-            // Add format-specific options
-            match format {
-                "webp" => cmd.arg(format!("{}[Q={}]", output_path, quality)),
-                "avif" => cmd.arg(format!("{}[Q={}]", output_path, quality)),
-                "jpeg" | "jpg" => cmd.arg(format!("{}[Q={}]", output_path, quality)),
-                _ => cmd.arg(output_path),
-            };
-        }
-
-        let output = cmd.output()
-            .map_err(|e| AppError::FileProcessing(format!("Failed to execute vips: {}", e)))?;
-
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::FileProcessing(format!("Vips processing failed: {}", error)));
-        }
-
-        Ok(())
-    }
-
-    async fn resize_with_image_crate(
-        input_path: &str,
-        output_path: &str,
-        width: Option<u32>,
-        height: Option<u32>,
-    ) -> Result<()> {
-        let img = image::open(input_path)
-            .map_err(|e| AppError::FileProcessing(format!("Failed to open image: {}", e)))?;
-
-        let processed_img = if let (Some(w), Some(h)) = (width, height) {
-            img.resize_exact(w, h, image::imageops::FilterType::Lanczos3)
-        } else if let Some(w) = width {
-            let aspect_ratio = img.height() as f32 / img.width() as f32;
-            let h = (w as f32 * aspect_ratio) as u32;
-            img.resize(w, h, image::imageops::FilterType::Lanczos3)
-        } else if let Some(h) = height {
-            let aspect_ratio = img.width() as f32 / img.height() as f32;
-            let w = (h as f32 * aspect_ratio) as u32;
-            img.resize(w, h, image::imageops::FilterType::Lanczos3)
-        } else {
-            img
-        };
-
-        processed_img.save(output_path)
-            .map_err(|e| AppError::FileProcessing(format!("Failed to save processed image: {}", e)))?;
-
-        Ok(())
-    }
-
-    async fn convert_format(
-        config: &ImageProcessingConfig,
-        input_path: &str,
-        output_path: &str,
-        format: &str,
-        quality: u8,
-    ) -> Result<()> {
-        Self::resize_image(config, input_path, output_path, None, None, format, quality).await
-    }
-
-    async fn get_image_dimensions(path: &str) -> Result<(u32, u32)> {
-        let img = image::open(path)
-            .map_err(|e| AppError::FileProcessing(format!("Failed to open image for dimensions: {}", e)))?;
         
-        Ok((img.width(), img.height()))
-    }
-
-    pub async fn optimize_image(
-        config: &ImageProcessingConfig,
-        input_path: &str,
-        output_path: &str,
-    ) -> Result<()> {
-        if config.use_vips {
-            // Use vips for optimization
-            let mut cmd = Command::new(&config.vips_path);
-            cmd.arg("copy")
-                .arg(input_path)
-                .arg(format!("{}[strip,optimize_coding]", output_path));
-
-            let output = cmd.output()
-                .map_err(|e| AppError::FileProcessing(format!("Failed to execute vips: {}", e)))?;
-
-            if !output.status.success() {
-                let error = String::from_utf8_lossy(&output.stderr);
-                return Err(AppError::FileProcessing(format!("Vips optimization failed: {}", error)));
-            }
-        } else {
-            // Use image crate for basic optimization
-            let img = image::open(input_path)
-                .map_err(|e| AppError::FileProcessing(format!("Failed to open image: {}", e)))?;
-
-            img.save(output_path)
-                .map_err(|e| AppError::FileProcessing(format!("Failed to save optimized image: {}", e)))?;
-        }
-
-        Ok(())
-    }
-
-    pub async fn shutdown(self) {
-        // Close the job sender to signal workers to stop
-        drop(self.job_sender);
-
-        // Wait for all workers to finish
-        for handle in self.worker_handles {
-            let _ = handle.await;
-        }
-
-        tracing::info!("Image processor shutdown complete");
+        Ok(false)
     }
 }
 
-// Virus scanning integration
-pub struct VirusScanner {
-    enabled: bool,
-    clamav_path: Option<String>,
+// Worker pool for concurrent image processing
+use tokio::sync::Semaphore;
+use std::sync::Arc;
+
+pub struct ImageProcessingPool {
+    semaphore: Arc<Semaphore>,
 }
 
-impl VirusScanner {
-    pub fn new(enabled: bool, clamav_path: Option<String>) -> Self {
+impl ImageProcessingPool {
+    pub fn new(max_concurrent: usize) -> Self {
         Self {
-            enabled,
-            clamav_path,
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
         }
     }
 
-    pub async fn scan_file(&self, file_path: &str) -> Result<bool> {
-        if !self.enabled {
-            return Ok(true); // Skip scanning if disabled
-        }
+    pub async fn process<F, T>(&self, task: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let _permit = self.semaphore.acquire().await
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("Failed to acquire processing permit")))?;
 
-        let clamav_path = self.clamav_path.as_ref()
-            .ok_or_else(|| AppError::FileProcessing("ClamAV path not configured".to_string()))?;
-
-        let output = Command::new(clamav_path)
-            .arg("--no-summary")
-            .arg("--infected")
-            .arg(file_path)
-            .output()
-            .map_err(|e| AppError::FileProcessing(format!("Failed to execute ClamAV: {}", e)))?;
-
-        // ClamAV returns 0 for clean files, 1 for infected files
-        match output.status.code() {
-            Some(0) => Ok(true),  // Clean
-            Some(1) => Ok(false), // Infected
-            _ => {
-                let error = String::from_utf8_lossy(&output.stderr);
-                Err(AppError::FileProcessing(format!("ClamAV scan failed: {}", error)))
-            }
-        }
-    }
-
-    pub async fn scan_bytes(&self, data: &[u8]) -> Result<bool> {
-        if !self.enabled {
-            return Ok(true);
-        }
-
-        // Write to temporary file and scan
-        let temp_dir = std::env::temp_dir();
-        let temp_file = temp_dir.join(format!("scan_{}.tmp", Uuid::new_v4()));
-        
-        fs::write(&temp_file, data).await
-            .map_err(|e| AppError::FileProcessing(format!("Failed to write temp file for scanning: {}", e)))?;
-
-        let result = self.scan_file(temp_file.to_str().unwrap()).await;
-
-        // Clean up temp file
-        let _ = fs::remove_file(&temp_file).await;
+        let result = tokio::task::spawn_blocking(task).await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("Processing task failed: {}", e)))?;
 
         result
     }
@@ -504,29 +387,118 @@ impl VirusScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use crate::models::ImageTransformParams;
 
-    #[tokio::test]
-    async fn test_image_processor_creation() {
-        let config = ImageProcessingConfig {
-            use_vips: false,
-            vips_path: "vips".to_string(),
-            thumbnail_sizes: vec![64, 128, 256],
-            quality_webp: 80,
-            quality_avif: 70,
-            max_workers: 2,
+    // Test image data (1x1 pixel PNG)
+    const TEST_PNG_DATA: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+        0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82
+    ];
+
+    #[test]
+    fn test_detect_format_from_data() {
+        let result = ImageProcessor::detect_format_from_data(TEST_PNG_DATA);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), ImageFormat::Png);
+    }
+
+    #[test]
+    fn test_get_image_info() {
+        let result = ImageProcessor::get_image_info(TEST_PNG_DATA);
+        assert!(result.is_ok());
+        
+        let info = result.unwrap();
+        assert_eq!(info.width, 1);
+        assert_eq!(info.height, 1);
+        assert_eq!(info.format, ImageFormat::Png);
+    }
+
+    #[test]
+    fn test_validate_image_valid() {
+        let result = ImageProcessor::validate_image(TEST_PNG_DATA, 1000, 1024 * 1024);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_image_too_large_file() {
+        let result = ImageProcessor::validate_image(TEST_PNG_DATA, 1000, 10);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), AppError::FileTooLarge));
+    }
+
+    #[test]
+    fn test_validate_image_dimensions_too_large() {
+        // This test would need a larger test image to properly test dimension limits
+        let result = ImageProcessor::validate_image(TEST_PNG_DATA, 0, 1024 * 1024);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), AppError::ImageTooLarge));
+    }
+
+    #[test]
+    fn test_transform_image_resize() {
+        let params = ImageTransformParams {
+            width: Some(100),
+            height: Some(100),
+            quality: Some(85),
+            format: Some("jpeg".to_string()),
         };
 
-        let processor = ImageProcessor::new(&config);
-        assert_eq!(processor.worker_handles.len(), 2);
+        let result = ImageProcessor::transform_image(TEST_PNG_DATA, &params);
+        assert!(result.is_ok());
         
-        processor.shutdown().await;
+        let output = result.unwrap();
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_generate_thumbnail() {
+        let result = ImageProcessor::generate_thumbnail(TEST_PNG_DATA, 64);
+        assert!(result.is_ok());
+        
+        let thumbnail = result.unwrap();
+        assert!(!thumbnail.is_empty());
+    }
+
+    #[test]
+    fn test_optimize_image() {
+        let options = ProcessingOptions::default();
+        let result = ImageProcessor::optimize_image(TEST_PNG_DATA, &options);
+        assert!(result.is_ok());
+        
+        let optimized = result.unwrap();
+        assert!(!optimized.is_empty());
+    }
+
+    #[test]
+    fn test_is_animated_gif() {
+        // Test with non-animated data
+        let result = ImageProcessor::is_animated(TEST_PNG_DATA);
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
     }
 
     #[tokio::test]
-    async fn test_virus_scanner() {
-        let scanner = VirusScanner::new(false, None);
-        let result = scanner.scan_bytes(b"test data").await.unwrap();
-        assert!(result); // Should return true when disabled
+    async fn test_image_processing_pool() {
+        let pool = ImageProcessingPool::new(2);
+        
+        let result = pool.process(|| {
+            Ok("test result".to_string())
+        }).await;
+        
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "test result");
+    }
+
+    #[test]
+    fn test_processing_options_default() {
+        let options = ProcessingOptions::default();
+        assert!(options.optimize);
+        assert!(options.strip_metadata);
+        assert!(options.progressive);
+        assert_eq!(options.quality, 85);
     }
 }
