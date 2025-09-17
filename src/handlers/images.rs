@@ -37,7 +37,7 @@ pub async fn get_image(
             .header(header::CONTENT_LENGTH, cached_data.file_size.to_string())
             .header(header::CACHE_CONTROL, "public, max-age=31536000") // 1 year
             .body(Body::from(file_data))?;
-            
+
         return Ok(response);
     }
 

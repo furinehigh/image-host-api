@@ -138,7 +138,7 @@ pub async fn upload_image(
         sha256_hash: crypto::calculate_sha256(&final_data), // Hash of processed image
         storage_path: storage_path.to_string_lossy().to_string(),
         created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now()
     };
 
     let created_image = state.database.create_image(&image).await?;
