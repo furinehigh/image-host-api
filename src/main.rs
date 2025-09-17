@@ -1,6 +1,6 @@
 #[macro_use]
 extern crate rocket;
-use serde_json;
+
 #[macro_use]
 extern crate lazy_static;
 
@@ -13,7 +13,7 @@ use background_optimization::{optimize_image_and_update, optimize_images_from_da
 use base64::{engine::general_purpose, Engine as _};
 use dotenv::dotenv;
 use log::info;
-use rocket::data::ToByteUnit; // <-- ADDED IMPORT
+use rocket::data::ToByteUnit;
 use rocket::http::{ContentType, Header, Status};
 use rocket::response::{Redirect, status::Custom};
 use rocket::serde::{json::Json, Deserialize, Serialize};
@@ -24,16 +24,12 @@ use rocket_multipart_form_data::{
 use std::io::Cursor;
 use tokio::{join, task};
 use util::ImageId;
-// No need for separate serde_json import if using rocket::serde::json::Json
 
 lazy_static! {
     static ref HOST: String = std::env::var("HOST").unwrap_or("i.dishis.tech".to_string());
 }
 
-// =================================================================
-// Structs for API Requests and Responses
-// =================================================================
-
+// Structs for API Requests and Responses (unchanged)
 #[derive(Deserialize)]
 struct ApiUploadRequest {
     base64: Option<String>,
@@ -81,18 +77,13 @@ struct ApiErrorResponse {
     status: u16,
 }
 
-// =================================================================
-// Helper Functions
-// =================================================================
-
+// Helper Functions (unchanged)
 async fn download_image_from_url(url: &str) -> Result<(Vec<u8>, String), String> {
     info!("Downloading image from URL: {}", url);
     let response = reqwest::get(url).await.map_err(|e| format!("Network error: {}", e))?;
-
     if !response.status().is_success() {
         return Err(format!("Failed to download image: Server returned status {}", response.status()));
     }
-
     let content_type = response.headers().get("content-type").and_then(|value| value.to_str().ok()).unwrap_or("application/octet-stream").to_string();
     let image_bytes = response.bytes().await.map_err(|e| e.to_string())?.to_vec();
     info!("Successfully downloaded {} bytes", image_bytes.len());
@@ -111,6 +102,7 @@ fn mime_to_extension(mime_type: &str) -> &str {
     mime_type.split('/').last().unwrap_or("jpg")
 }
 
+// `process_and_respond` function (unchanged from the previous corrected version)
 async fn process_and_respond(
     image_bytes: Vec<u8>,
     content_type_string: &str,
@@ -135,7 +127,6 @@ async fn process_and_respond(
 
     info!("Successfully uploaded image {}", &image_id);
 
-    // FIX #1: Clone the document for the background task
     let doc_for_bg = inserted_doc.clone();
     let owned_images_collection = images_collection.clone();
     task::spawn(async move {
@@ -144,7 +135,6 @@ async fn process_and_respond(
 
     let id_str = image_id.to_string();
     let base_url = format!("https://{}", *HOST);
-    // Use the original `inserted_doc` which is still owned by this function
     let creation_time = inserted_doc.get_datetime("date").unwrap().timestamp_millis() / 1000;
     let image_ext = mime_to_extension(&encoded_image.content_type);
     let thumb_ext = mime_to_extension(&encoded_thumbnail.content_type);
@@ -228,18 +218,20 @@ async fn api_upload_route(
             Err(create_error(Status::BadRequest, "Form field 'image' is missing."))
         }
     } else if content_type.is_json() {
-        // FIX #2: Read data to bytes and then deserialize with serde_json
         let bytes = data.open(10.megabytes()).into_bytes().await.map_err(|e| create_error(Status::BadRequest, &format!("Failed to read payload: {}", e)))?;
-        let payload: ApiUploadRequest = serde_json::from_slice(&bytes).map_err(|e| create_error(Status::BadRequest, &format!("Invalid JSON: {}", e)))?;
+        
+        // FIX #1: Use the full path to `from_slice`
+        let payload: ApiUploadRequest = rocket::serde::json::from_slice(&bytes).map_err(|e| create_error(Status::BadRequest, &format!("Invalid JSON: {}", e)))?;
 
-        match (payload.base64, payload.url) {
-            (Some(b64), None) => {
+        // FIX #2: Use `ref` in the match pattern to borrow instead of move
+        match (&payload.base64, &payload.url) {
+            (Some(ref b64), None) => {
                 let image_bytes = general_purpose::STANDARD.decode(b64).map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string"))?;
                 let kind = infer::get(&image_bytes).ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type from Base64 data."))?;
                 process_and_respond(image_bytes, kind.mime_type(), &collections.images).await
             },
-            (None, Some(url)) => {
-                let (image_bytes, ct) = download_image_from_url(&url).await.map_err(|e| create_error(Status::BadRequest, &e))?;
+            (None, Some(ref url)) => {
+                let (image_bytes, ct) = download_image_from_url(url).await.map_err(|e| create_error(Status::BadRequest, &e))?;
                 process_and_respond(image_bytes, &ct, &collections.images).await
             },
             _ => Err(create_error(Status::BadRequest, "Please provide 'base64' or 'url' in the JSON payload, but not both.")),
@@ -259,10 +251,9 @@ async fn view_image_route(id: String, collections: &State<db::Collections>) -> O
     let data = doc.get_binary_generic("data").unwrap().clone();
     let ct = doc.get_str("content_type").unwrap().to_string();
     
-    // FIX #3: Use `async move` to give ownership to the background task
     let images_collection = collections.images.clone();
+    // This `async move` block is the correct pattern for `task::spawn`
     task::spawn(async move {
-        // The `id` string is moved here, satisfying the 'static lifetime
         db::update_last_seen(&images_collection, &ImageId(id)).await.ok();
     });
 
