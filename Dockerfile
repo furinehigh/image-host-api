@@ -22,7 +22,7 @@ COPY Cargo.toml Cargo.lock ./
 
 # Copy source so Cargo sees main.rs
 COPY src ./src
-COPY Rocket.toml .   # include if your app uses it
+COPY Rocket.toml .
 
 # Fetch dependencies (this caches deps properly)
 RUN cargo fetch
@@ -50,8 +50,8 @@ WORKDIR /app
 # Copy binary
 COPY --from=builder /app/target/release/image-host-api /usr/local/bin/image-host-api
 
-# Copy Rocket.toml into /app
-COPY Rocket.toml /app/Rocket.toml
+# Copy config files if needed
+COPY Rocket.toml .
 
 # Permissions
 RUN chown appuser:appuser /usr/local/bin/image-host-api
