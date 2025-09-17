@@ -83,6 +83,7 @@ tempfile = "3.8"
 serial_test = "3.0"
 mockall = "0.12"
 wiremock = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bin]]
 name = "image-hosting-server"
