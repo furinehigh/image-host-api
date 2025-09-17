@@ -50,8 +50,8 @@ WORKDIR /app
 # Copy binary
 COPY --from=builder /app/target/release/image-host-api /usr/local/bin/image-host-api
 
-# Copy config files if needed
-COPY Rocket.toml .
+# Copy Rocket.toml into /app
+COPY Rocket.toml /app/Rocket.toml
 
 # Permissions
 RUN chown appuser:appuser /usr/local/bin/image-host-api
