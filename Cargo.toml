@@ -1,98 +1,28 @@
 [package]
-name = "image-hosting-server"
-version = "0.1.0"
 edition = "2021"
+name = "image-host"
+version = "0.5.6"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# Web framework
-axum = { version = "0.7", features = ["multipart", "tracing"] }
-tokio = { version = "1.0", features = ["full"] }
-tower = { version = "0.4", features = ["util", "timeout", "load-shed", "limit"] }
-tower-http = { version = "0.5", features = ["fs", "trace", "cors", "compression-gzip"] }
+base64 = "0.21.4"
+bson = "^2.7.0"
+dotenv = "^0.15.0"
+futures = "^0.3.28"
+image = "^0.24.7"
+lazy_static = "1.4.0"
+log = "^0.4"
+mongodb = "^2.7.0"
+oxipng = "^9.0.0"
+rand = "^0.8.5"
+rayon = "^1.8.0"
+rocket = { version = "^0.5.0-rc.3", features = ["json"] }
+rocket-multipart-form-data = "^0.10.6"
+serde = "^1.0"
+tokio = "^1.33.0"
+webp = "^0.2.6"
 
-# Database
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate"] }
-uuid = { version = "1.0", features = ["v4", "serde"] }
-
-# Redis
-redis = { version = "0.24", features = ["tokio-comp", "connection-manager", "script"] }
-
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-bincode = "1.3"
-
-# HTTP client
-reqwest = { version = "0.11", features = ["json", "multipart"] }
-
-# Image processing
-image = "0.24"
-libvips = { version = "1.5", optional = true }
-
-# Cryptography
-sha2 = "0.10"
-bcrypt = "0.15"
-rand = "0.8"
-base64 = "0.21"
-
-# JWT authentication
-jsonwebtoken = "9.0"
-
-# Compression
-flate2 = "1.0"
-
-# Time handling
-chrono = { version = "0.4", features = ["serde"] }
-
-# Logging and tracing
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Configuration
-config = "0.14"
-dotenvy = "0.15"
-
-# Error handling
-anyhow = "1.0"
-thiserror = "1.0"
-
-# File handling
-tempfile = "3.8"
-mime = "0.3"
-mime_guess = "2.0"
-
-# Async utilities
-futures = "0.3"
-tokio-util = { version = "0.7", features = ["io"] }
-
-# OpenAPI documentation
-utoipa = { version = "4.0", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-swagger-ui = { version = "6.0", features = ["axum"] }
-
-# Metrics
-prometheus = "0.13"
-
-[features]
-default = ["libvips"]
-libvips = ["dep:libvips"]
-
-[dev-dependencies]
-tower-test = "0.4"
-tokio-test = "0.4"
-tempfile = "3.8"
-serial_test = "3.0"
-mockall = "0.12"
-wiremock = "0.5"
-criterion = { version = "0.5", features = ["html_reports"] }
-
-[[bin]]
-name = "image-hosting-server"
-path = "src/main.rs"
-
-[profile.test]
-opt-level = 1
-debug = true
-
-[[bench]]
-name = "image_processing"
-harness = false
+[dependencies.rocket_dyn_templates]
+features = ["tera"]
+version = "^0.1.0-rc.3"
