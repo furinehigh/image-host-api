@@ -29,7 +29,7 @@ lazy_static! {
     static ref HOST: String = std::env::var("HOST").unwrap_or("i.dishis.tech".to_string());
 }
 
-// Structs for API Requests and Responses (unchanged)
+// Structs for API Requests and Responses
 #[derive(Deserialize)]
 struct ApiUploadRequest {
     base64: Option<String>,
@@ -77,7 +77,7 @@ struct ApiErrorResponse {
     status: u16,
 }
 
-// Helper Functions (unchanged)
+// Helper Functions
 async fn download_image_from_url(url: &str) -> Result<(Vec<u8>, String), String> {
     info!("Downloading image from URL: {}", url);
     let response = reqwest::get(url).await.map_err(|e| format!("Network error: {}", e))?;
@@ -102,7 +102,6 @@ fn mime_to_extension(mime_type: &str) -> &str {
     mime_type.split('/').last().unwrap_or("jpg")
 }
 
-// `process_and_respond` function (unchanged from the previous corrected version)
 async fn process_and_respond(
     image_bytes: Vec<u8>,
     content_type_string: &str,
@@ -163,10 +162,7 @@ async fn process_and_respond(
     }))
 }
 
-// =================================================================
 // Rocket Routes
-// =================================================================
-
 #[derive(Responder)]
 #[response(status = 200)]
 struct HtmlResponder(&'static str, Header<'static>);
@@ -217,6 +213,22 @@ async fn api_upload_route(
         } else {
             Err(create_error(Status::BadRequest, "Form field 'image' is missing."))
         }
+    } else if content_type.is_json() {
+        let bytes = data.open(10.megabytes()).into_bytes().await.map_err(|e| create_error(Status::BadRequest, &format!("Failed to read payload: {}", e)))?;
+        let payload: ApiUploadRequest = rocket::serde::json::from_slice(&bytes).map_err(|e| create_error(Status::BadRequest, &format!("Invalid JSON: {}", e)))?;
+
+        match (&payload.base64, &payload.url) {
+            (Some(ref b64), None) => {
+                let image_bytes = general_purpose::STANDARD.decode(b64).map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string"))?;
+                let kind = infer::get(&image_bytes).ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type from Base64 data."))?;
+                process_and_respond(image_bytes, kind.mime_type(), &collections.images).await
+            },
+            (None, Some(ref url)) => {
+                let (image_bytes, ct) = download_image_from_url(url).await.map_err(|e| create_error(Status::BadRequest, &e))?;
+                process_and_respond(image_bytes, &ct, &collections.images).await
+            },
+            _ => Err(create_error(Status::BadRequest, "Please provide 'base64' or 'url' in the JSON payload, but not both.")),
+        }
     } else {
         Err(create_error(Status::UnsupportedMediaType, "Content-Type must be 'multipart/form-data' or 'application/json'."))
     }
@@ -233,7 +245,6 @@ async fn view_image_route(id: String, collections: &State<db::Collections>) -> O
     let ct = doc.get_str("content_type").unwrap().to_string();
     
     let images_collection = collections.images.clone();
-    // This `async move` block is the correct pattern for `task::spawn`
     task::spawn(async move {
         db::update_last_seen(&images_collection, &ImageId(id)).await.ok();
     });
@@ -270,7 +281,7 @@ async fn rocket() -> _ {
         .mount("/", routes![
             index,
             upload_from_web_route,
-            api_upload_route, // This should be the ONLY route for POST /api/upload
+            api_upload_route,
             view_image_route,
             redirect_image_route,
             view_thumbnail_route
