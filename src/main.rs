@@ -37,12 +37,14 @@ struct ApiUploadRequest {
     url: Option<String>,
 }
 
-// Struct to handle application/x-www-form-urlencoded data
+// UPDATED: This struct now accepts an optional base64 string OR an optional url string.
 #[derive(FromForm)]
 struct UrlEncodedUpload<'r> {
     #[field(name = "image")]
-    base64: &'r str,
+    base64: Option<&'r str>,
+    url: Option<&'r str>,
 }
+
 
 #[derive(Serialize)]
 struct ApiImageVariant {
@@ -110,7 +112,6 @@ fn mime_to_extension(mime_type: &str) -> &str {
     mime_type.split('/').last().unwrap_or("jpg")
 }
 
-// This is the core logic, now fully reusable by all upload endpoints.
 async fn process_and_respond(
     image_bytes: Vec<u8>,
     content_type_string: &str,
@@ -207,7 +208,7 @@ async fn upload_from_web_route(
     }
 }
 
-// --- UPDATED API ROUTES ---
+// --- API ROUTES ---
 
 // Route 1: Handles application/json
 #[post("/api/upload", rank = 1, format = "json", data = "<payload>")]
@@ -229,15 +230,24 @@ async fn api_upload_json(
     }
 }
 
-// Route 2: Handles application/x-www-form-urlencoded
+// UPDATED: Route 2 now handles both base64 and url fields from a form.
 #[post("/api/upload", rank = 2, format = "form", data = "<form>")]
 async fn api_upload_form(
     form: Form<UrlEncodedUpload<'_>>,
     collections: &State<db::Collections>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
-    let image_bytes = general_purpose::STANDARD.decode(form.base64).map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string in 'image' field"))?;
-    let kind = infer::get(&image_bytes).ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type from Base64 data."))?;
-    process_and_respond(image_bytes, kind.mime_type(), &collections.images).await
+    match (form.base64, form.url) {
+        (Some(b64), None) => {
+            let image_bytes = general_purpose::STANDARD.decode(b64).map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string in 'image' field"))?;
+            let kind = infer::get(&image_bytes).ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type from Base64 data."))?;
+            process_and_respond(image_bytes, kind.mime_type(), &collections.images).await
+        }
+        (None, Some(url)) => {
+            let (image_bytes, ct) = download_image_from_url(url).await.map_err(|e| create_error(Status::BadRequest, &e))?;
+            process_and_respond(image_bytes, &ct, &collections.images).await
+        }
+        _ => Err(create_error(Status::BadRequest, "Please provide 'image' (as base64) or 'url' in the form, but not both.")),
+    }
 }
 
 // Route 3: Handles multipart/form-data as a fallback
@@ -318,7 +328,6 @@ async fn rocket() -> _ {
         .mount("/", routes![
             index,
             upload_from_web_route,
-            // UPDATED: Mount the three new, specific API routes
             api_upload_json,
             api_upload_form,
             api_upload_multipart,
