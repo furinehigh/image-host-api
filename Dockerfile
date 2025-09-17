@@ -21,18 +21,18 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 
 # Copy the actual crate
-COPY rust-image-host ./rust-image-host
+COPY image-host-api ./image-host-api
 
-WORKDIR /app/rust-image-host
+WORKDIR /app/image-host-api
 
 RUN cargo fetch
-RUN cargo build --release --bin rust-image-host
+RUN cargo build --release --bin image-host-api
 
 # Copy source
 COPY . .
 
 # Build final binary
-RUN cargo build --release --bin rust-image-host
+RUN cargo build --release --bin image-host-api
 
 ########################################
 # Runtime stage
@@ -52,10 +52,10 @@ RUN useradd --no-create-home --shell /usr/sbin/nologin appuser
 WORKDIR /app
 
 # Copy binary
-COPY --from=builder /app/target/release/rust-image-host /usr/local/bin/rust-image-host
+COPY --from=builder /app/target/release/image-host-api /usr/local/bin/image-host-api
 
 # Permissions
-RUN chown appuser:appuser /usr/local/bin/rust-image-host
+RUN chown appuser:appuser /usr/local/bin/image-host-api
 
 # Drop privileges
 USER appuser
@@ -66,4 +66,4 @@ ENV APP_ADDR=0.0.0.0:8080
 EXPOSE 8080
 
 # Start the application
-CMD ["/usr/local/bin/rust-image-host"]
+CMD ["/usr/local/bin/image-host-api"]
