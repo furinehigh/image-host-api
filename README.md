@@ -13,20 +13,20 @@ A high-performance, production-ready image hosting server built with Rust, featu
 
 ### 1. Server Setup
 
-\`\`\`bash
+```bash
 # Clone the repository
 git clone <repository-url>
 cd rust-image-hosting
 
 # Copy and configure environment
 cp .env.example .env
-\`\`\`
+```
 
 ### 2. Environment Configuration
 
 Edit `.env` with your production values:
 
-\`\`\`env
+```env
 # Database
 DATABASE_URL=postgresql://username:password@db:5432/image_hosting
 DATABASE_MAX_CONNECTIONS=20
@@ -54,11 +54,11 @@ ENABLE_METRICS=true
 # Optional: Virus Scanning
 CLAMAV_HOST=clamav
 CLAMAV_PORT=3310
-\`\`\`
+```
 
 ### 3. Production Deployment
 
-\`\`\`bash
+```bash
 # Deploy with Docker Compose
 docker-compose up -d
 
@@ -67,7 +67,7 @@ docker-compose ps
 
 # View logs
 docker-compose logs -f app
-\`\`\`
+```
 
 ### 4. SSL and Reverse Proxy
 
@@ -80,48 +80,48 @@ The included Nginx configuration handles:
 
 Update `nginx/nginx.conf` with your domain:
 
-\`\`\`nginx
+```nginx
 server_name your-domain.com;
 ssl_certificate /etc/ssl/certs/your-domain.crt;
 ssl_certificate_key /etc/ssl/private/your-domain.key;
-\`\`\`
+```
 
 ### 5. Database Initialization
 
-\`\`\`bash
+```bash
 # Run database migrations
 docker-compose exec app sqlx migrate run
 
 # Create initial admin user (optional)
 docker-compose exec app cargo run --bin create-admin
-\`\`\`
+```
 
 ## 🔧 Production Configuration
 
 ### Performance Tuning
 
 #### Database Optimization
-\`\`\`sql
+```sql
 -- PostgreSQL configuration (postgresql.conf)
 shared_buffers = 1GB
 effective_cache_size = 3GB
 work_mem = 64MB
 maintenance_work_mem = 256MB
 max_connections = 100
-\`\`\`
+```
 
 #### Redis Configuration
-\`\`\`conf
+```conf
 # redis.conf
 maxmemory 512mb
 maxmemory-policy allkeys-lru
 save 900 1
 save 300 10
 save 60 10000
-\`\`\`
+```
 
 #### Application Tuning
-\`\`\`env
+```env
 # Worker threads (CPU cores * 2)
 TOKIO_WORKER_THREADS=4
 
@@ -132,12 +132,12 @@ DATABASE_MIN_CONNECTIONS=5
 # File upload limits
 MAX_FILE_SIZE=52428800  # 50MB
 MAX_CONCURRENT_UPLOADS=10
-\`\`\`
+```
 
 ### Security Hardening
 
 #### 1. Firewall Configuration
-\`\`\`bash
+```bash
 # UFW firewall rules
 ufw allow 22/tcp    # SSH
 ufw allow 80/tcp    # HTTP
@@ -145,13 +145,13 @@ ufw allow 443/tcp   # HTTPS
 ufw deny 5432/tcp   # PostgreSQL (internal only)
 ufw deny 6379/tcp   # Redis (internal only)
 ufw enable
-\`\`\`
+```
 
 #### 2. SSL/TLS Setup
-\`\`\`bash
+```bash
 # Let's Encrypt with Certbot
 certbot --nginx -d your-domain.com
-\`\`\`
+```
 
 #### 3. Security Headers
 Already configured in `nginx/nginx.conf`:
@@ -173,7 +173,7 @@ Key metrics monitored:
 - File upload/download bandwidth
 
 #### 2. Log Management
-\`\`\`bash
+```bash
 # View application logs
 docker-compose logs -f app
 
@@ -182,40 +182,40 @@ docker-compose logs -f nginx
 
 # Export logs to external system
 docker-compose logs --no-color app | logger -t image-hosting
-\`\`\`
+```
 
 #### 3. Health Monitoring
-\`\`\`bash
+```bash
 # Health check endpoint
 curl https://your-domain.com/health
 
 # Automated monitoring with cron
 */5 * * * * curl -f https://your-domain.com/health || echo "Service down" | mail admin@domain.com
-\`\`\`
+```
 
 ## 🔄 Maintenance
 
 ### Backup Strategy
 
 #### 1. Database Backups
-\`\`\`bash
+```bash
 # Daily automated backup
 ./scripts/backup.sh
 
 # Manual backup
 docker-compose exec db pg_dump -U username image_hosting > backup_$(date +%Y%m%d).sql
-\`\`\`
+```
 
 #### 2. File Storage Backups
-\`\`\`bash
+```bash
 # Sync uploads to S3/backup location
 rsync -av ./uploads/ backup-server:/backups/uploads/
-\`\`\`
+```
 
 ### Updates and Deployment
 
 #### 1. Zero-Downtime Updates
-\`\`\`bash
+```bash
 # Pull latest changes
 git pull origin main
 
@@ -224,13 +224,13 @@ docker-compose build app
 
 # Rolling update
 docker-compose up -d --no-deps app
-\`\`\`
+```
 
 #### 2. Database Migrations
-\`\`\`bash
+```bash
 # Run migrations during maintenance window
 docker-compose exec app sqlx migrate run
-\`\`\`
+```
 
 ### Scaling Considerations
 
@@ -251,25 +251,25 @@ docker-compose exec app sqlx migrate run
 ### Common Issues
 
 #### High Memory Usage
-\`\`\`bash
+```bash
 # Check memory usage
 docker stats
 
 # Optimize image processing
 # Reduce concurrent workers in config
-\`\`\`
+```
 
 #### Database Connection Issues
-\`\`\`bash
+```bash
 # Check database connectivity
 docker-compose exec app pg_isready -h db
 
 # Monitor connection pool
 curl https://your-domain.com/metrics | grep db_connections
-\`\`\`
+```
 
 #### File Upload Failures
-\`\`\`bash
+```bash
 # Check disk space
 df -h
 
@@ -278,7 +278,7 @@ ls -la uploads/
 
 # Check file size limits
 grep MAX_FILE_SIZE .env
-\`\`\`
+```
 
 ### Performance Monitoring
 
@@ -290,14 +290,14 @@ grep MAX_FILE_SIZE .env
 - Uptime > 99.9%
 
 #### Alerting Thresholds
-\`\`\`bash
+```bash
 # Set up alerts for:
 # - Response time > 500ms
 # - Error rate > 1%
 # - Disk usage > 80%
 # - Memory usage > 90%
 # - Database connections > 80% of pool
-\`\`\`
+```
 
 ## 📞 Support
 
