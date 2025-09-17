@@ -22,6 +22,8 @@ rocket-multipart-form-data = "^0.10.6"
 serde = "^1.0"
 tokio = "^1.33.0"
 webp = "^0.2.6"
+infer = "0.15"
+reqwest = { version = "0.12", features = ["json"] } # <--- ADD THIS LINE
 
 [dependencies.rocket_dyn_templates]
 features = ["tera"]
