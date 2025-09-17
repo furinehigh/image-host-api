@@ -1,32 +1,41 @@
-# docker-compose.yml
 version: "3.8"
 
 services:
   app:
-    build: . # Build the Dockerfile in the current directory
+    build: .
     container_name: image-host-api-app-1
     ports:
-      - "8000:8080" # Map host port 8000 to the container's port 8080
+      - "8000:8080" # optional, only needed if you want local access
     environment:
-      # These are the variables your Rust code is looking for
       - MONGODB_URI=mongodb://mongo:27017
       - MONGODB_DB_NAME=image_host
-      # This variable is used by your code to generate full URLs
       - HOST=localhost:8000
-      # These are for Rocket, telling it to listen on all interfaces inside the container
       - ROCKET_ADDRESS=0.0.0.0
       - ROCKET_PORT=8080
     depends_on:
-      - mongo # Ensures the database starts before the app
+      - mongo
 
   mongo:
     image: mongo:latest
     container_name: image-host-api-mongo-1
     restart: always
     volumes:
-      - mongodb_data:/data/db # Persist database data
+      - mongodb_data:/data/db
     ports:
-      - "27017" # Optional: allows you to connect to the DB from your host machine
+      - "27017"
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: image-host-api-tunnel
+    command: tunnel run my-tunnel
+    restart: always
+    volumes:
+      - ./cloudflared:/etc/cloudflared
+    depends_on:
+      - app
+    # optional: link to app container by network name
+    networks:
+      - default
 
 volumes:
   mongodb_data:
