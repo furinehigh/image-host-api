@@ -8,12 +8,15 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     libvips-dev \
     build-essential \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Copy manifests first for better layer caching
 COPY Cargo.toml Cargo.lock ./
+
+COPY benches ./benches
 
 # Create a dummy main.rs to build dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
@@ -37,6 +40,7 @@ RUN apt-get update && apt-get install -y \
     libpq5 \
     libvips42 \
     libssl3 \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
