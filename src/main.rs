@@ -13,6 +13,7 @@ use background_optimization::{optimize_image_and_update, optimize_images_from_da
 use base64::{engine::general_purpose, Engine as _};
 use dotenv::dotenv;
 use log::info;
+use rocket::data::ToByteUnit; // <-- ADDED IMPORT
 use rocket::http::{ContentType, Header, Status};
 use rocket::response::{Redirect, status::Custom};
 use rocket::serde::{json::Json, Deserialize, Serialize};
@@ -23,9 +24,9 @@ use rocket_multipart_form_data::{
 use std::io::Cursor;
 use tokio::{join, task};
 use util::ImageId;
+// No need for separate serde_json import if using rocket::serde::json::Json
 
 lazy_static! {
-    // UPDATED: Use your new domain
     static ref HOST: String = std::env::var("HOST").unwrap_or("i.dishis.tech".to_string());
 }
 
@@ -33,7 +34,6 @@ lazy_static! {
 // Structs for API Requests and Responses
 // =================================================================
 
-/// JSON payload for URL or Base64 uploads
 #[derive(Deserialize)]
 struct ApiUploadRequest {
     base64: Option<String>,
@@ -85,8 +85,6 @@ struct ApiErrorResponse {
 // Helper Functions
 // =================================================================
 
-/// Downloads an image from a URL.
-/// Returns the image bytes and its content type.
 async fn download_image_from_url(url: &str) -> Result<(Vec<u8>, String), String> {
     info!("Downloading image from URL: {}", url);
     let response = reqwest::get(url).await.map_err(|e| format!("Network error: {}", e))?;
@@ -95,47 +93,33 @@ async fn download_image_from_url(url: &str) -> Result<(Vec<u8>, String), String>
         return Err(format!("Failed to download image: Server returned status {}", response.status()));
     }
 
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-
+    let content_type = response.headers().get("content-type").and_then(|value| value.to_str().ok()).unwrap_or("application/octet-stream").to_string();
     let image_bytes = response.bytes().await.map_err(|e| e.to_string())?.to_vec();
     info!("Successfully downloaded {} bytes", image_bytes.len());
     Ok((image_bytes, content_type))
 }
 
-/// Helper to create a standardized JSON error response.
 fn create_error(status: Status, message: &str) -> Custom<Json<ApiErrorResponse>> {
-    Custom(
-        status,
-        Json(ApiErrorResponse {
-            error: message.to_string(),
-            success: false,
-            status: status.code,
-        }),
-    )
+    Custom(status, Json(ApiErrorResponse {
+        error: message.to_string(),
+        success: false,
+        status: status.code,
+    }))
 }
 
-/// Helper function to get a file extension from a MIME type.
 fn mime_to_extension(mime_type: &str) -> &str {
     mime_type.split('/').last().unwrap_or("jpg")
 }
 
-/// Central function to process image data, save it, and create the API response.
 async fn process_and_respond(
     image_bytes: Vec<u8>,
     content_type_string: &str,
     images_collection: &mongodb::Collection<mongodb::bson::Document>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
-    // Create a DynamicImage from the in-memory bytes
     let mut reader = image::io::Reader::new(Cursor::new(&image_bytes));
     reader.set_format(util::mimetype_to_format(content_type_string));
     let decoded_image = reader.decode().map_err(|e| create_error(Status::BadRequest, &format!("Failed to decode image: {}", e)))?;
 
-    // Create futures for encoding, thumbnailing, and generating an ID
     let (encoded_image_result, encoded_thumbnail_result, image_id_result) = join!(
         encoding::from_image(decoded_image.clone(), encoding::FromImageOptions::default()),
         encoding::from_image(decoded_image, encoding::FromImageOptions { max_size: Some(128), ..encoding::FromImageOptions::default() }),
@@ -146,21 +130,21 @@ async fn process_and_respond(
     let encoded_thumbnail = encoded_thumbnail_result.map_err(|e| create_error(Status::InternalServerError, &e))?;
     let image_id = image_id_result.map_err(|e| create_error(Status::InternalServerError, &e.to_string()))?;
 
-    // Insert into database
     let insert_result = db::insert_image(images_collection, &db::NewImage { id: &image_id, data: &encoded_image.data, content_type: &encoded_image.content_type, thumbnail_data: &encoded_thumbnail.data, thumbnail_content_type: &encoded_thumbnail.content_type, size: encoded_image.size, optim_level: 0 }).await;
     let inserted_doc = insert_result.map_err(|_| create_error(Status::InternalServerError, "DB insert failed"))?.ok_or_else(|| create_error(Status::InternalServerError, "DB did not return doc"))?;
 
     info!("Successfully uploaded image {}", &image_id);
 
-    // Spawn background optimization task
+    // FIX #1: Clone the document for the background task
+    let doc_for_bg = inserted_doc.clone();
     let owned_images_collection = images_collection.clone();
     task::spawn(async move {
-        optimize_image_and_update(&owned_images_collection, &inserted_doc).await.ok();
+        optimize_image_and_update(&owned_images_collection, &doc_for_bg).await.ok();
     });
 
-    // Build the detailed API response
     let id_str = image_id.to_string();
     let base_url = format!("https://{}", *HOST);
+    // Use the original `inserted_doc` which is still owned by this function
     let creation_time = inserted_doc.get_datetime("date").unwrap().timestamp_millis() / 1000;
     let image_ext = mime_to_extension(&encoded_image.content_type);
     let thumb_ext = mime_to_extension(&encoded_thumbnail.content_type);
@@ -217,7 +201,6 @@ async fn upload_from_web_route(
         let image_bytes = tokio::fs::read(&file.path).await.map_err(|_| create_error(Status::InternalServerError, "Could not read temp file"))?;
         let content_type = file.content_type.as_ref().ok_or_else(|| create_error(Status::BadRequest, "MIME type is required"))?.to_string();
         
-        // We call the central processor but only use the ID for the redirect
         let response = process_and_respond(image_bytes, &content_type, &collections.images).await?;
         Ok(Redirect::to(uri!(view_image_route(response.data.id.clone()))))
     } else {
@@ -225,7 +208,6 @@ async fn upload_from_web_route(
     }
 }
 
-// NEW: Unified API upload endpoint
 #[post("/api/upload", data = "<data>")]
 async fn api_upload_route(
     content_type: &ContentType,
@@ -233,7 +215,6 @@ async fn api_upload_route(
     collections: &State<db::Collections>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
     if content_type.is_form_data() {
-        // --- Handle Multipart/Form-Data Upload ---
         let options = MultipartFormDataOptions::with_multipart_form_data_fields(vec![
             MultipartFormDataField::file("image").content_type_by_string(Some(mime::IMAGE_STAR)).unwrap(),
         ]);
@@ -247,18 +228,18 @@ async fn api_upload_route(
             Err(create_error(Status::BadRequest, "Form field 'image' is missing."))
         }
     } else if content_type.is_json() {
-        // --- Handle JSON (Base64 or URL) Upload ---
-        let payload: Json<ApiUploadRequest> = data.open(rocket::data::ToByteUnit::megabytes(10)).into_json().await
-            .map_err(|_| create_error(Status::BadRequest, "Invalid JSON payload"))?;
+        // FIX #2: Read data to bytes and then deserialize with serde_json
+        let bytes = data.open(10.megabytes()).into_bytes().await.map_err(|e| create_error(Status::BadRequest, &format!("Failed to read payload: {}", e)))?;
+        let payload: ApiUploadRequest = serde_json::from_slice(&bytes).map_err(|e| create_error(Status::BadRequest, &format!("Invalid JSON: {}", e)))?;
 
-        match (&payload.base64, &payload.url) {
+        match (payload.base64, payload.url) {
             (Some(b64), None) => {
                 let image_bytes = general_purpose::STANDARD.decode(b64).map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string"))?;
                 let kind = infer::get(&image_bytes).ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type from Base64 data."))?;
                 process_and_respond(image_bytes, kind.mime_type(), &collections.images).await
             },
             (None, Some(url)) => {
-                let (image_bytes, ct) = download_image_from_url(url).await.map_err(|e| create_error(Status::BadRequest, &e))?;
+                let (image_bytes, ct) = download_image_from_url(&url).await.map_err(|e| create_error(Status::BadRequest, &e))?;
                 process_and_respond(image_bytes, &ct, &collections.images).await
             },
             _ => Err(create_error(Status::BadRequest, "Please provide 'base64' or 'url' in the JSON payload, but not both.")),
@@ -277,7 +258,14 @@ async fn view_image_route(id: String, collections: &State<db::Collections>) -> O
     let doc = db::get_image(&collections.images, &id).await.ok()??;
     let data = doc.get_binary_generic("data").unwrap().clone();
     let ct = doc.get_str("content_type").unwrap().to_string();
-    task::spawn(db::update_last_seen(&collections.images.clone(), &ImageId(id)));
+    
+    // FIX #3: Use `async move` to give ownership to the background task
+    let images_collection = collections.images.clone();
+    task::spawn(async move {
+        // The `id` string is moved here, satisfying the 'static lifetime
+        db::update_last_seen(&images_collection, &ImageId(id)).await.ok();
+    });
+
     Some(ImageResponder(data, Header::new("Content-Type", ct)))
 }
 
@@ -310,7 +298,7 @@ async fn rocket() -> _ {
         .mount("/", routes![
             index,
             upload_from_web_route,
-            api_upload_route, // The single, unified endpoint
+            api_upload_route,
             view_image_route,
             redirect_image_route,
             view_thumbnail_route
