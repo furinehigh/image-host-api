@@ -14,7 +14,6 @@ use base64::{engine::general_purpose, Engine as _};
 use dotenv::dotenv;
 use log::info;
 use rocket::data::ToByteUnit;
-use rocket::form::Form;
 use rocket::http::{ContentType, Header, Status};
 use rocket::response::{Redirect, status::Custom};
 use rocket::serde::{json::Json, Deserialize, Serialize};
@@ -96,7 +95,7 @@ async fn download_image_from_url(url: &str) -> Result<(Vec<u8>, String), String>
         .unwrap_or("application/octet-stream")
         .to_string();
     let image_bytes = response.bytes().await.map_err(|e| e.to_string())?.to_vec();
-    info!("Successfully downloaded {} bytes", image_bytes.len());
+    info!("Successfully downloaded {} bytes with content-type: {}", image_bytes.len(), content_type);
     Ok((image_bytes, content_type))
 }
 
@@ -124,12 +123,11 @@ async fn process_and_respond(
         return Err(create_error(Status::BadRequest, "Image data cannot be empty."));
     }
 
-    // Attempt decoding with detected format first, fallback to auto-detect
-    let mut reader = image::io::Reader::new(Cursor::new(&image_bytes));
-    reader.set_format(util::mimetype_to_format(content_type_string));
-    let decoded_image = reader.decode().or_else(|_| {
-        image::load_from_memory(&image_bytes)
-    }).map_err(|e| {
+    info!("Processing {} bytes of image data with provided content-type: {}", image_bytes.len(), content_type_string);
+
+    // --- FIX: Use image::load_from_memory to automatically detect the format ---
+    // This is more robust than relying on the provided content_type_string.
+    let decoded_image = image::load_from_memory(&image_bytes).map_err(|e| {
         create_error(
             Status::BadRequest,
             &format!("Failed to decode image: {}", e),
@@ -260,7 +258,7 @@ async fn api_upload_unified(
             Ok(req) => {
                 if let Some(mut b64) = req.base64 {
                     // Strip "data:image/...;base64," if present
-                    if let Some(idx) = b64.find(",") {
+                    if let Some(idx) = b64.find(',') {
                         if b64.starts_with("data:") {
                             b64 = b64[idx + 1..].to_string();
                         }
@@ -317,7 +315,7 @@ async fn api_upload_unified(
             if !texts.is_empty() {
                 let mut value = texts[0].text.trim().to_string();
                 if value.starts_with("data:") {
-                    if let Some(idx) = value.find(",") {
+                    if let Some(idx) = value.find(',') {
                         value = value[idx + 1..].to_string();
                     }
                 }
@@ -388,6 +386,7 @@ fn redirect_image_route(id: String) -> Redirect {
 #[launch]
 async fn rocket() -> _ {
     dotenv().ok();
+    env_logger::init(); // Initialize logger
     let images_collection = db::connect().await.unwrap();
     println!("Connected to database");
 
