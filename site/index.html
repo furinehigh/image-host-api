@@ -135,6 +135,8 @@
 			display: none
 		}
 
+
+
 		.image-input-button::after {
 			content: 'Upload image'
 		}
@@ -193,7 +195,8 @@
 			<h1><span class="important-title-part">i</span>.furine.vercel.app</h1>
 			<p class="subtitle">An extremely simple image host for now</p>
 			<hr />
-			<form method="post" enctype="multipart/form-data" action="/" id="form">
+			<!-- The action attribute has been corrected here -->
+			<form method="post" enctype="multipart/form-data" action="/api/upload" id="form">
 				<label for="image-input" class="image-input-label">
 					<span class="button image-input-button"></span>
 				</label>
