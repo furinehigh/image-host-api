@@ -14,6 +14,7 @@ use base64::{engine::general_purpose, Engine as _};
 use dotenv::dotenv;
 use log::info;
 use rocket::data::ToByteUnit;
+use rocket::form::Form;
 use rocket::http::{ContentType, Header, Status};
 use rocket::response::{Redirect, status::Custom};
 use rocket::serde::{json::Json, Deserialize, Serialize};
@@ -28,6 +29,12 @@ use util::ImageId;
 
 lazy_static! {
     static ref HOST: String = std::env::var("HOST").unwrap_or("i.dishis.tech".to_string());
+}
+
+// --- Form Structs ---
+#[derive(FromForm)]
+struct UrlencodedUpload {
+    image: String,
 }
 
 // --- API Structs ---
@@ -114,6 +121,34 @@ fn mime_to_extension(mime_type: &str) -> &str {
     mime_type.split('/').last().unwrap_or("jpg")
 }
 
+/// Helper to process an upload that comes as a text string (URL or Base64)
+async fn process_text_upload(
+    mut text_value: String,
+    images_collection: &mongodb::Collection<mongodb::bson::Document>,
+) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
+    text_value = text_value.trim().to_string();
+
+    // Handle URL
+    if text_value.starts_with("http://") || text_value.starts_with("https://") {
+        let (image_bytes, ct) = download_image_from_url(&text_value)
+            .await.map_err(|e| create_error(Status::BadRequest, &e))?;
+        return process_and_respond(image_bytes, &ct, images_collection).await;
+    }
+
+    // Handle Base64
+    if let Some(idx) = text_value.find(',') {
+        if text_value.starts_with("data:") {
+            text_value = text_value[idx + 1..].to_string();
+        }
+    }
+    let image_bytes = general_purpose::STANDARD.decode(&text_value)
+        .map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string"))?;
+    let kind = infer::get(&image_bytes)
+        .ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type from Base64 data"))?;
+    
+    process_and_respond(image_bytes, kind.mime_type(), images_collection).await
+}
+
 async fn process_and_respond(
     image_bytes: Vec<u8>,
     content_type_string: &str,
@@ -125,8 +160,6 @@ async fn process_and_respond(
 
     info!("Processing {} bytes of image data with provided content-type: {}", image_bytes.len(), content_type_string);
 
-    // --- FIX: Use image::load_from_memory to automatically detect the format ---
-    // This is more robust than relying on the provided content_type_string.
     let decoded_image = image::load_from_memory(&image_bytes).map_err(|e| {
         create_error(
             Status::BadRequest,
@@ -241,47 +274,43 @@ fn index() -> HtmlResponder {
     )
 }
 
-#[post("/api/upload", data = "<data>")]
-async fn api_upload_unified(
+// --- REFACTORED UPLOAD HANDLERS ---
+
+/// Handles `application/json` uploads. Rank 1 means this is tried first for matching requests.
+#[post("/api/upload", data = "<data>", format = "json", rank = 1)]
+async fn api_upload_json(
+    data: Json<ApiUploadRequest>,
+    collections: &State<db::Collections>,
+) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
+    let req = data.into_inner();
+    if let Some(b64) = req.base64 {
+        return process_text_upload(b64, &collections.images).await;
+    }
+    if let Some(url) = req.url {
+        let (image_bytes, ct) = download_image_from_url(&url)
+            .await.map_err(|e| create_error(Status::BadRequest, &e))?;
+        return process_and_respond(image_bytes, &ct, &collections.images).await;
+    }
+    Err(create_error(Status::BadRequest, "Missing 'base64' or 'url' field in JSON."))
+}
+
+/// Handles `application/x-www-form-urlencoded` uploads. Rank 2 means this is tried second.
+#[post("/api/upload", data = "<form>", format = "form", rank = 2)]
+async fn api_upload_form(
+    form: Form<UrlencodedUpload>,
+    collections: &State<db::Collections>,
+) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
+    process_text_upload(form.into_inner().image, &collections.images).await
+}
+
+/// Handles `multipart/form-data` and raw binary uploads. Rank 3 is a fallback.
+#[post("/api/upload", data = "<data>", rank = 3)]
+async fn api_upload_fallback(
     content_type: &ContentType,
     data: Data<'_>,
     collections: &State<db::Collections>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
-    // --- CASE 1: JSON ---
-    if content_type.is_json() {
-        let bytes = data.open(20.megabytes()).into_bytes().await
-            .map_err(|_| create_error(Status::BadRequest, "Failed to read JSON payload"))?
-            .into_inner();
-
-        let payload: Result<ApiUploadRequest, _> = serde_json::from_slice(&bytes);
-        match payload {
-            Ok(req) => {
-                if let Some(mut b64) = req.base64 {
-                    // Strip "data:image/...;base64," if present
-                    if let Some(idx) = b64.find(',') {
-                        if b64.starts_with("data:") {
-                            b64 = b64[idx + 1..].to_string();
-                        }
-                    }
-                    let image_bytes = general_purpose::STANDARD
-                        .decode(&b64)
-                        .map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string"))?;
-                    let kind = infer::get(&image_bytes)
-                        .ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type"))?;
-                    return process_and_respond(image_bytes, kind.mime_type(), &collections.images).await;
-                }
-                if let Some(url) = req.url {
-                    let (image_bytes, ct) = download_image_from_url(&url)
-                        .await.map_err(|e| create_error(Status::BadRequest, &e))?;
-                    return process_and_respond(image_bytes, &ct, &collections.images).await;
-                }
-                return Err(create_error(Status::BadRequest, "Missing 'base64' or 'url' field in JSON."));
-            }
-            Err(_) => return Err(create_error(Status::BadRequest, "Invalid JSON payload")),
-        }
-    }
-
-    // --- CASE 2: Multipart/form-data ---
+    // --- CASE 1: Multipart/form-data ---
     if content_type.is_form_data() {
         let options = MultipartFormDataOptions::with_multipart_form_data_fields(vec![
             MultipartFormDataField::file("image")
@@ -290,52 +319,27 @@ async fn api_upload_unified(
             MultipartFormDataField::text("image"),
         ]);
 
-        let parsed = MultipartFormData::parse(content_type, data, options).await;
-        let form_data = match parsed {
-            Ok(f) => f,
-            Err(e) => return Err(create_error(Status::BadRequest, &format!("Form parse error: {}", e))),
-        };
+        let form_data = MultipartFormData::parse(content_type, data, options).await
+            .map_err(|e| create_error(Status::BadRequest, &format!("Form parse error: {}", e)))?;
 
         if let Some(files) = form_data.files.get("image") {
-            if !files.is_empty() {
-                let file = &files[0];
+            if let Some(file) = files.get(0) {
                 let image_bytes = tokio::fs::read(&file.path).await
                     .map_err(|_| create_error(Status::InternalServerError, "Could not read uploaded file"))?;
-                let ct = file.content_type
-                    .as_ref()
-                    .map(|ct| ct.to_string())
-                    .unwrap_or_else(|| infer::get(&image_bytes)
-                        .map(|k| k.mime_type().to_string())
-                        .unwrap_or_else(|| "application/octet-stream".to_string()));
+                let ct = file.content_type.as_ref().map(|ct| ct.to_string())
+                    .unwrap_or_else(|| infer::get(&image_bytes).map(|k| k.mime_type().to_string()).unwrap_or_else(|| "application/octet-stream".to_string()));
                 return process_and_respond(image_bytes, &ct, &collections.images).await;
             }
         }
-
         if let Some(texts) = form_data.texts.get("image") {
-            if !texts.is_empty() {
-                let mut value = texts[0].text.trim().to_string();
-                if value.starts_with("data:") {
-                    if let Some(idx) = value.find(',') {
-                        value = value[idx + 1..].to_string();
-                    }
-                }
-                if value.starts_with("http://") || value.starts_with("https://") {
-                    let (image_bytes, ct) = download_image_from_url(&value)
-                        .await.map_err(|e| create_error(Status::BadRequest, &e))?;
-                    return process_and_respond(image_bytes, &ct, &collections.images).await;
-                }
-                let image_bytes = general_purpose::STANDARD.decode(&value)
-                    .map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string"))?;
-                let kind = infer::get(&image_bytes)
-                    .ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type"))?;
-                return process_and_respond(image_bytes, kind.mime_type(), &collections.images).await;
+            if let Some(text_field) = texts.get(0) {
+                return process_text_upload(text_field.text.clone(), &collections.images).await;
             }
         }
-
-        return Err(create_error(Status::BadRequest, "Missing 'image' field in form."));
+        return Err(create_error(Status::BadRequest, "Missing 'image' field in multipart form."));
     }
 
-    // --- CASE 3: Raw binary ---
+    // --- CASE 2: Raw binary ---
     let image_bytes = data.open(20.megabytes()).into_bytes().await
         .map_err(|_| create_error(Status::BadRequest, "Failed to read request body"))?
         .into_inner();
@@ -344,13 +348,13 @@ async fn api_upload_unified(
         return Err(create_error(Status::BadRequest, "No image data received."));
     }
 
-    let ct = match infer::get(&image_bytes) {
-        Some(kind) => kind.mime_type().to_string(),
-        None => "application/octet-stream".to_string(),
-    };
+    let ct = infer::get(&image_bytes)
+        .map(|kind| kind.mime_type().to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
 
     process_and_respond(image_bytes, &ct, &collections.images).await
 }
+
 
 #[derive(Responder)]
 #[response(status = 200)]
@@ -386,7 +390,7 @@ fn redirect_image_route(id: String) -> Redirect {
 #[launch]
 async fn rocket() -> _ {
     dotenv().ok();
-    env_logger::init(); // Initialize logger
+    env_logger::init(); 
     let images_collection = db::connect().await.unwrap();
     println!("Connected to database");
 
@@ -401,7 +405,10 @@ async fn rocket() -> _ {
         .manage(collections)
         .mount("/", routes![
             index,
-            api_upload_unified,
+            // Mount all the upload handlers
+            api_upload_json,
+            api_upload_form,
+            api_upload_fallback,
             view_image_route,
             redirect_image_route,
             view_thumbnail_route
