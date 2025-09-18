@@ -18,7 +18,7 @@ use rocket::form::Form;
 use rocket::http::{ContentType, Header, Status};
 use rocket::response::{Redirect, status::Custom};
 use rocket::serde::{json::Json, Deserialize, Serialize};
-use rocket::serde::{json::serde_json}; // <-- fixes serde_json unresolved crate
+use rocket::serde::json::serde_json;
 use rocket::{Data, State};
 use rocket_multipart_form_data::{
     mime, MultipartFormData, MultipartFormDataField, MultipartFormDataOptions,
@@ -124,9 +124,12 @@ async fn process_and_respond(
         return Err(create_error(Status::BadRequest, "Image data cannot be empty."));
     }
 
+    // Attempt decoding with detected format first, fallback to auto-detect
     let mut reader = image::io::Reader::new(Cursor::new(&image_bytes));
     reader.set_format(util::mimetype_to_format(content_type_string));
-    let decoded_image = reader.decode().map_err(|e| {
+    let decoded_image = reader.decode().or_else(|_| {
+        image::load_from_memory(&image_bytes)
+    }).map_err(|e| {
         create_error(
             Status::BadRequest,
             &format!("Failed to decode image: {}", e),
@@ -240,15 +243,12 @@ fn index() -> HtmlResponder {
     )
 }
 
-// Unified upload route (handles JSON, URL, Base64, file, raw binary)
 #[post("/api/upload", data = "<data>")]
 async fn api_upload_unified(
     content_type: &ContentType,
     data: Data<'_>,
     collections: &State<db::Collections>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
-    use rocket::data::ToByteUnit;
-
     // --- CASE 1: JSON ---
     if content_type.is_json() {
         let bytes = data.open(20.megabytes()).into_bytes().await
@@ -258,8 +258,15 @@ async fn api_upload_unified(
         let payload: Result<ApiUploadRequest, _> = serde_json::from_slice(&bytes);
         match payload {
             Ok(req) => {
-                if let Some(b64) = req.base64 {
-                    let image_bytes = general_purpose::STANDARD.decode(b64)
+                if let Some(mut b64) = req.base64 {
+                    // Strip "data:image/...;base64," if present
+                    if let Some(idx) = b64.find(",") {
+                        if b64.starts_with("data:") {
+                            b64 = b64[idx + 1..].to_string();
+                        }
+                    }
+                    let image_bytes = general_purpose::STANDARD
+                        .decode(&b64)
                         .map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string"))?;
                     let kind = infer::get(&image_bytes)
                         .ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type"))?;
@@ -291,7 +298,6 @@ async fn api_upload_unified(
             Err(e) => return Err(create_error(Status::BadRequest, &format!("Form parse error: {}", e))),
         };
 
-        // File case
         if let Some(files) = form_data.files.get("image") {
             if !files.is_empty() {
                 let file = &files[0];
@@ -307,16 +313,20 @@ async fn api_upload_unified(
             }
         }
 
-        // Text case (could be base64 or URL)
         if let Some(texts) = form_data.texts.get("image") {
             if !texts.is_empty() {
-                let value = texts[0].text.trim();
+                let mut value = texts[0].text.trim().to_string();
+                if value.starts_with("data:") {
+                    if let Some(idx) = value.find(",") {
+                        value = value[idx + 1..].to_string();
+                    }
+                }
                 if value.starts_with("http://") || value.starts_with("https://") {
-                    let (image_bytes, ct) = download_image_from_url(value)
+                    let (image_bytes, ct) = download_image_from_url(&value)
                         .await.map_err(|e| create_error(Status::BadRequest, &e))?;
                     return process_and_respond(image_bytes, &ct, &collections.images).await;
                 }
-                let image_bytes = general_purpose::STANDARD.decode(value)
+                let image_bytes = general_purpose::STANDARD.decode(&value)
                     .map_err(|_| create_error(Status::BadRequest, "Invalid Base64 string"))?;
                 let kind = infer::get(&image_bytes)
                     .ok_or_else(|| create_error(Status::BadRequest, "Could not determine image type"))?;
@@ -344,7 +354,6 @@ async fn api_upload_unified(
     process_and_respond(image_bytes, &ct, &collections.images).await
 }
 
-// Image viewing routes
 #[derive(Responder)]
 #[response(status = 200)]
 struct ImageResponder(Vec<u8>, Header<'static>);
